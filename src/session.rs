@@ -13,11 +13,16 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    audio::{
+        opus_decode::OpusPcmDecoder,
+        silero_vad::{SileroVadStream, VadEvent},
+    },
     protocol::{self, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
     services::{AsrStream, ServiceBundle, TextStream, TtsEvent},
 };
 
-const TEMP_LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_SAMPLE_RATE: u32 = 16_000;
+const DEFAULT_LISTEN_MAX_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -38,6 +43,8 @@ struct SessionState {
     already_triggered: bool,
     listen_mode: Option<String>,
     asr: Option<Box<dyn AsrStream>>,
+    audio_decoder: Option<OpusPcmDecoder>,
+    vad: Option<SileroVadStream>,
     listen_timeout: Option<JoinHandle<()>>,
     pipeline: Option<JoinHandle<()>>,
     listen_started_at: Option<Instant>,
@@ -180,20 +187,56 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                 let asr_start = Instant::now();
                 tracing::debug!(session_id = ctx.id, "starting asr stream");
                 match ctx.services.asr.start_stream().await {
-                    Ok(asr) => {
+                    Ok(mut asr) => {
                         tracing::debug!(
                             session_id = ctx.id,
                             elapsed_ms = asr_start.elapsed().as_millis(),
                             "asr stream started"
                         );
+
+                        let audio_decoder = match OpusPcmDecoder::new(CLIENT_SAMPLE_RATE) {
+                            Ok(decoder) => decoder,
+                            Err(err) => {
+                                let error_chain = format_error_chain(err.as_ref());
+                                tracing::warn!(
+                                    session_id = ctx.id,
+                                    error_chain,
+                                    "failed to create opus decoder for input audio"
+                                );
+                                asr.abort().await;
+                                return true;
+                            }
+                        };
+
+                        let vad = match ctx
+                            .services
+                            .vad
+                            .as_ref()
+                            .map(|vad| vad.start_stream())
+                            .transpose()
+                        {
+                            Ok(vad) => vad,
+                            Err(err) => {
+                                let error_chain = format_error_chain(err.as_ref());
+                                tracing::warn!(
+                                    session_id = ctx.id,
+                                    error_chain,
+                                    "failed to start VAD stream"
+                                );
+                                asr.abort().await;
+                                return true;
+                            }
+                        };
+
+                        let max_timeout = listen_max_timeout();
                         let timeout_ctx = ctx.clone();
                         let timeout_state = state.clone();
                         let listen_timeout = tokio::spawn(async move {
-                            sleep(TEMP_LISTEN_TIMEOUT).await;
+                            sleep(max_timeout).await;
                             finish_listening(
                                 timeout_ctx,
                                 timeout_state,
-                                "temporary listen timeout",
+                                "maximum listen timeout",
                                 false,
                             )
                             .await;
@@ -204,6 +247,8 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                         guard.already_triggered = false;
                         guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
                         guard.asr = Some(asr);
+                        guard.audio_decoder = Some(audio_decoder);
+                        guard.vad = vad;
                         guard.listen_started_at = Some(Instant::now());
                         guard.first_audio_logged = false;
                         guard.input_frames = 0;
@@ -213,7 +258,8 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                         tracing::info!(
                             session_id = ctx.id,
                             mode = ?guard.listen_mode,
-                            timeout_ms = TEMP_LISTEN_TIMEOUT.as_millis(),
+                            vad_enabled = guard.vad.is_some(),
+                            timeout_ms = max_timeout.as_millis(),
                             "listen started"
                         );
                     }
@@ -287,15 +333,69 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
         );
     }
 
-    if let Some(asr) = guard.asr.as_mut() {
-        if let Err(err) = asr.push_audio(frame).await {
+    let samples = match guard
+        .audio_decoder
+        .as_mut()
+        .map(|decoder| decoder.decode_to_pcm_i16(&frame.payload))
+    {
+        Some(Ok(samples)) => samples,
+        Some(Err(err)) => {
             let error_chain = format_error_chain(err.as_ref());
             tracing::warn!(
                 session_id = ctx.id,
                 error_chain,
-                "failed to push audio to asr stream"
+                "failed to decode input opus frame"
+            );
+            return;
+        }
+        None => return,
+    };
+
+    if let Some(asr) = guard.asr.as_mut() {
+        if let Err(err) = asr.push_pcm(&samples).await {
+            let error_chain = format_error_chain(err.as_ref());
+            tracing::warn!(
+                session_id = ctx.id,
+                error_chain,
+                "failed to push pcm to asr stream"
             );
         }
+    }
+
+    let mut finish_reason = None;
+    if let Some(vad) = guard.vad.as_mut() {
+        match vad.accept_pcm(&samples) {
+            Ok(events) => {
+                for event in events {
+                    match event {
+                        VadEvent::SpeechStart { sample } => {
+                            tracing::debug!(session_id = ctx.id, sample, "VAD speech started");
+                        }
+                        VadEvent::SpeechEnd {
+                            start_sample,
+                            end_sample,
+                        } => {
+                            tracing::info!(
+                                session_id = ctx.id,
+                                start_sample,
+                                end_sample,
+                                "VAD speech ended"
+                            );
+                            finish_reason = Some("vad speech ended");
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let error_chain = format_error_chain(err.as_ref());
+                tracing::warn!(session_id = ctx.id, error_chain, "VAD processing failed");
+            }
+        }
+    }
+    drop(guard);
+
+    if let Some(reason) = finish_reason {
+        finish_listening(ctx.clone(), state.clone(), reason, true).await;
     }
 }
 
@@ -319,6 +419,8 @@ async fn finish_listening(
             guard.listen_started_at = None;
             guard.first_audio_logged = false;
             guard.input_frames = 0;
+            guard.audio_decoder = None;
+            guard.vad = None;
             (
                 guard.asr.take(),
                 if abort_timeout {
@@ -523,6 +625,11 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
         let mut guard = state.lock().await;
         guard.listening = false;
         guard.already_triggered = false;
+        guard.audio_decoder = None;
+        guard.vad = None;
+        guard.listen_started_at = None;
+        guard.first_audio_logged = false;
+        guard.input_frames = 0;
         (
             guard.pipeline.take(),
             guard.asr.take(),
@@ -557,6 +664,14 @@ async fn send_json(ctx: &SessionContext, value: Value) {
             "failed to enqueue json: websocket closed"
         );
     }
+}
+
+fn listen_max_timeout() -> Duration {
+    std::env::var("XIAOZHI_LISTEN_MAX_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(DEFAULT_LISTEN_MAX_TIMEOUT)
 }
 
 fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {

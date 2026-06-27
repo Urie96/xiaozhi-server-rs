@@ -28,6 +28,7 @@ pkgs.mkShell {
 
     openssl
     libopus
+    onnxruntime
     pkg-config
     cargo-deny
     cargo-edit
@@ -38,5 +39,11 @@ pkgs.mkShell {
   env = {
     # Required by rust-analyzer
     RUST_SRC_PATH = "${rust-tool-chain}/lib/rustlib/src/rust/library";
+
+    # Keep ort/onnxruntime Nix-friendly: do not download ONNX Runtime at build
+    # time, and load the runtime library provided by nixpkgs at process start.
+    ORT_SKIP_DOWNLOAD = "1";
+    ORT_DYLIB_PATH = "${pkgs.onnxruntime}/lib/libonnxruntime.so";
+    LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [ pkgs.onnxruntime ];
   };
 }

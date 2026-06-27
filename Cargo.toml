@@ -11,7 +11,9 @@ axum = { version = "0.8", features = ["ws", "json"] }
 bytes = "1"
 futures-util = "0.3"
 flate2 = "1"
+ndarray = "0.16"
 opus = "0.3"
+ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }

@@ -9,7 +9,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::Stream;
 
-use crate::protocol::AudioFrame;
+use crate::{
+    audio::silero_vad::{SileroVadConfig, SileroVadService},
+    protocol::AudioFrame,
+};
 
 use self::{
     mock::{MockAsr, MockLlm, MockTts},
@@ -28,7 +31,7 @@ pub trait AsrService: Send + Sync + 'static {
 
 #[async_trait]
 pub trait AsrStream: Send + 'static {
-    async fn push_audio(&mut self, frame: AudioFrame) -> Result<()>;
+    async fn push_pcm(&mut self, samples: &[i16]) -> Result<()>;
     async fn finish(&mut self) -> Result<String>;
     async fn abort(&mut self);
 }
@@ -52,6 +55,7 @@ pub struct ServiceBundle {
     pub asr: Arc<dyn AsrService>,
     pub llm: Arc<dyn LlmService>,
     pub tts: Arc<dyn TtsService>,
+    pub vad: Option<Arc<SileroVadService>>,
 }
 
 impl ServiceBundle {
@@ -91,6 +95,24 @@ impl ServiceBundle {
             }
         };
 
+        let vad = match SileroVadConfig::from_env()? {
+            Some(config) => {
+                tracing::info!(
+                    model_path = %config.model_path.display(),
+                    threshold = config.threshold,
+                    min_silence_ms = config.min_silence_duration_ms,
+                    min_speech_ms = config.min_speech_duration_ms,
+                    max_speech_seconds = config.max_speech_duration_s,
+                    "using Silero VAD"
+                );
+                Some(Arc::new(SileroVadService::new(config)))
+            }
+            None => {
+                tracing::info!("VAD disabled; using timeout/manual stop only");
+                None
+            }
+        };
+
         let llm: Arc<dyn LlmService> = match OpenAiLlmConfig::from_env()? {
             Some(config) => {
                 tracing::info!(
@@ -108,6 +130,6 @@ impl ServiceBundle {
             }
         };
 
-        Ok(Self { asr, llm, tts })
+        Ok(Self { asr, llm, tts, vad })
     }
 }

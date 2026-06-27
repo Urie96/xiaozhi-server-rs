@@ -30,7 +30,7 @@ struct MockAsrStream {
 
 #[async_trait]
 impl AsrStream for MockAsrStream {
-    async fn push_audio(&mut self, _frame: AudioFrame) -> Result<()> {
+    async fn push_pcm(&mut self, _samples: &[i16]) -> Result<()> {
         self.frames += 1;
         Ok(())
     }

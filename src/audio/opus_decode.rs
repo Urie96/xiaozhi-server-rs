@@ -20,16 +20,19 @@ impl OpusPcmDecoder {
         })
     }
 
-    pub fn decode_to_pcm_le(&mut self, packet: &[u8]) -> Result<Vec<u8>> {
+    pub fn decode_to_pcm_i16(&mut self, packet: &[u8]) -> Result<Vec<i16>> {
         let samples = self
             .decoder
             .decode(packet, &mut self.scratch, false)
             .context("decode opus packet")?;
-
-        let mut out = Vec::with_capacity(samples * 2);
-        for sample in &self.scratch[..samples] {
-            out.extend_from_slice(&sample.to_le_bytes());
-        }
-        Ok(out)
+        Ok(self.scratch[..samples].to_vec())
     }
+}
+
+pub fn pcm_i16_to_le_bytes(samples: &[i16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        out.extend_from_slice(&sample.to_le_bytes());
+    }
+    out
 }

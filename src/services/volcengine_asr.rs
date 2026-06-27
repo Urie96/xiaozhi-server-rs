@@ -14,8 +14,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use crate::{
-    audio::opus_decode::OpusPcmDecoder,
-    protocol::AudioFrame,
+    audio::opus_decode::pcm_i16_to_le_bytes,
     services::{AsrService, AsrStream},
 };
 
@@ -109,7 +108,6 @@ pub struct VolcengineAsrStream {
     config: VolcengineAsrConfig,
     write: Option<AsrWrite>,
     reader: Option<JoinHandle<Result<String>>>,
-    decoder: OpusPcmDecoder,
     pcm_buffer: BytesMut,
     chunk_bytes: usize,
     finished: bool,
@@ -221,7 +219,6 @@ impl VolcengineAsrStream {
             config,
             write: Some(write),
             reader: Some(reader),
-            decoder: OpusPcmDecoder::new(ASR_SAMPLE_RATE)?,
             pcm_buffer: BytesMut::new(),
             chunk_bytes,
             finished: false,
@@ -250,11 +247,11 @@ impl VolcengineAsrStream {
 
 #[async_trait]
 impl AsrStream for VolcengineAsrStream {
-    async fn push_audio(&mut self, frame: AudioFrame) -> Result<()> {
+    async fn push_pcm(&mut self, samples: &[i16]) -> Result<()> {
         if self.finished {
             return Ok(());
         }
-        let pcm = self.decoder.decode_to_pcm_le(&frame.payload)?;
+        let pcm = pcm_i16_to_le_bytes(samples);
         self.pcm_buffer.extend_from_slice(&pcm);
         self.flush_ready_chunks().await
     }
