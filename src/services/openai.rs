@@ -5,7 +5,9 @@ use async_stream::try_stream;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use super::{LlmService, TextStream};
+use async_trait::async_trait;
+
+use super::{LlmSession, LlmSessionFactory, LlmSessionMeta, TextStream};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
@@ -95,12 +97,12 @@ impl OpenAiLlmConfig {
 }
 
 #[derive(Clone, Debug)]
-pub struct OpenAiLlm {
+pub struct OpenAiLlmFactory {
     config: OpenAiLlmConfig,
     client: reqwest::Client,
 }
 
-impl OpenAiLlm {
+impl OpenAiLlmFactory {
     pub fn new(config: OpenAiLlmConfig) -> Self {
         Self {
             config,
@@ -109,8 +111,25 @@ impl OpenAiLlm {
     }
 }
 
-impl LlmService for OpenAiLlm {
-    fn chat_stream(&self, prompt: String) -> TextStream {
+#[async_trait]
+impl LlmSessionFactory for OpenAiLlmFactory {
+    async fn create_session(&self, _session_meta: LlmSessionMeta) -> Result<Box<dyn LlmSession>> {
+        Ok(Box::new(OpenAiLlmSession {
+            config: self.config.clone(),
+            client: self.client.clone(),
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OpenAiLlmSession {
+    config: OpenAiLlmConfig,
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl LlmSession for OpenAiLlmSession {
+    fn chat_stream(&mut self, prompt: String) -> TextStream {
         let config = self.config.clone();
         let client = self.client.clone();
 
@@ -239,6 +258,10 @@ impl LlmService for OpenAiLlm {
             }
         })
     }
+
+    async fn abort(&mut self) {}
+
+    async fn shutdown(&mut self) {}
 }
 
 fn apply_thinking_config(body: &mut Value, config: &OpenAiLlmConfig) {

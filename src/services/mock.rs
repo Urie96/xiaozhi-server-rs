@@ -11,7 +11,10 @@ use crate::{
     protocol::{AudioFrame, SERVER_FRAME_DURATION_MS},
 };
 
-use super::{AsrService, AsrStream, LlmService, TextStream, TtsEvent, TtsService, TtsStream};
+use super::{
+    AsrService, AsrStream, LlmSession, LlmSessionFactory, LlmSessionMeta, TextStream, TtsEvent,
+    TtsService, TtsStream,
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct MockAsr;
@@ -46,10 +49,21 @@ impl AsrStream for MockAsrStream {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct MockLlm;
+pub struct MockLlmFactory;
 
-impl LlmService for MockLlm {
-    fn chat_stream(&self, prompt: String) -> TextStream {
+#[async_trait]
+impl LlmSessionFactory for MockLlmFactory {
+    async fn create_session(&self, _session_meta: LlmSessionMeta) -> Result<Box<dyn LlmSession>> {
+        Ok(Box::new(MockLlmSession))
+    }
+}
+
+#[derive(Debug)]
+struct MockLlmSession;
+
+#[async_trait]
+impl LlmSession for MockLlmSession {
+    fn chat_stream(&mut self, prompt: String) -> TextStream {
         let chunks = vec![
             "你好，".to_string(),
             "我是 Rust 版小智服务端。".to_string(),
@@ -62,6 +76,10 @@ impl LlmService for MockLlm {
             Ok(chunk)
         }))
     }
+
+    async fn abort(&mut self) {}
+
+    async fn shutdown(&mut self) {}
 }
 
 #[derive(Clone, Debug)]

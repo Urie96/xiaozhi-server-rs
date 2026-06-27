@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{Arc, Mutex as StdMutex},
+    time::Instant,
+};
 
 use async_stream::try_stream;
 use axum::extract::ws::{Message, WebSocket};
@@ -18,7 +21,7 @@ use crate::{
         silero_vad::{SileroVadStream, VadEvent},
     },
     protocol::{self, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
-    services::{AsrStream, ServiceBundle, TextStream, TtsEvent},
+    services::{AsrStream, LlmSession, LlmSessionMeta, ServiceBundle, TextStream, TtsEvent},
     text_filter::filter_tts_text_stream,
 };
 
@@ -51,6 +54,7 @@ struct SessionState {
     listen_started_at: Option<Instant>,
     first_audio_logged: bool,
     input_frames: u64,
+    llm: Option<Box<dyn LlmSession>>,
 }
 
 #[derive(Clone)]
@@ -76,6 +80,23 @@ pub async fn handle_websocket(
         "websocket session connected"
     );
 
+    let llm_meta = LlmSessionMeta {
+        session_id: session_id.clone(),
+        device_id: meta.device_id.clone(),
+        client_id: meta.client_id.clone(),
+    };
+    let llm = match services.llm.create_session(llm_meta).await {
+        Ok(llm) => {
+            tracing::info!(session_id, "llm session created");
+            Some(llm)
+        }
+        Err(err) => {
+            let error_chain = format_error_chain(err.as_ref());
+            tracing::warn!(session_id, error_chain, "failed to create llm session");
+            None
+        }
+    };
+
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(128);
 
@@ -85,7 +106,24 @@ pub async fn handle_websocket(
             let message = match outbound {
                 Outbound::Text(value) => {
                     let text = value.to_string();
-                    tracing::debug!(session_id = writer_session_id, %text, "websocket send text");
+                    let is_error = serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|v| v.get("type").and_then(Value::as_str).map(str::to_string))
+                        .as_deref()
+                        == Some("error");
+                    if is_error {
+                        tracing::error!(
+                            session_id = writer_session_id,
+                            %text,
+                            "websocket send error message"
+                        );
+                    } else {
+                        tracing::debug!(
+                            session_id = writer_session_id,
+                            %text,
+                            "websocket send text"
+                        );
+                    }
                     Message::Text(text.into())
                 }
                 Outbound::Binary(bytes) => Message::Binary(bytes),
@@ -112,7 +150,10 @@ pub async fn handle_websocket(
         tx: out_tx.clone(),
         services,
     };
-    let state = Arc::new(Mutex::new(SessionState::default()));
+    let state = Arc::new(Mutex::new(SessionState {
+        llm,
+        ..SessionState::default()
+    }));
 
     while let Some(message) = ws_rx.next().await {
         match message {
@@ -144,6 +185,10 @@ pub async fn handle_websocket(
     }
 
     abort_active(&ctx, &state, false).await;
+    if let Some(mut llm) = state.lock().await.llm.take() {
+        llm.shutdown().await;
+        tracing::info!(session_id, "llm session shutdown complete");
+    }
     drop(out_tx);
     if let Err(err) = writer.await {
         tracing::debug!(session_id, %err, "websocket writer join error");
@@ -458,10 +503,11 @@ async fn trigger_conversation(
 ) {
     tracing::info!(session_id = ctx.id, "starting conversation pipeline");
     let pipeline_ctx = ctx.clone();
+    let pipeline_state = state.clone();
     let handle = tokio::spawn(async move {
-        if let Err(err) = run_pipeline(pipeline_ctx.clone(), asr).await {
+        if let Err(err) = run_pipeline(pipeline_ctx.clone(), pipeline_state, asr).await {
             let error_chain = format_error_chain(err.as_ref());
-            tracing::warn!(
+            tracing::error!(
                 session_id = pipeline_ctx.id,
                 error_chain,
                 "conversation pipeline failed"
@@ -476,7 +522,11 @@ async fn trigger_conversation(
     }
 }
 
-async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyhow::Result<()> {
+async fn run_pipeline(
+    ctx: SessionContext,
+    state: Arc<Mutex<SessionState>>,
+    mut asr: Box<dyn AsrStream>,
+) -> anyhow::Result<()> {
     let pipeline_started = Instant::now();
     tracing::debug!(session_id = ctx.id, "pipeline timing started");
 
@@ -500,7 +550,28 @@ async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyho
     );
 
     let llm_started = Instant::now();
-    let raw_llm_stream = ctx.services.llm.chat_stream(text);
+    let mut llm_guard = {
+        let mut guard = state.lock().await;
+        guard.llm.take()
+    };
+    let raw_llm_stream = match llm_guard.as_mut() {
+        Some(llm) => llm.chat_stream(text),
+        None => {
+            tracing::error!(
+                session_id = ctx.id,
+                "llm session not available; aborting conversation pipeline"
+            );
+            let _ = ctx
+                .tx
+                .send(Outbound::Text(serde_json::json!({
+                    "session_id": ctx.id,
+                    "type": "error",
+                    "message": "llm session not available"
+                })))
+                .await;
+            return Ok(());
+        }
+    };
     let llm_stream = instrument_llm_stream(
         ctx.id.clone(),
         pipeline_started,
@@ -510,6 +581,8 @@ async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyho
 
     let tts_started = Instant::now();
     let tts_input = filter_tts_text_stream(llm_stream);
+    let collected_text = Arc::new(StdMutex::new(String::new()));
+    let tts_input = tee_collect_text(tts_input, collected_text.clone());
     let mut tts_stream = ctx.services.tts.synthesize_stream(tts_input);
     tracing::debug!(
         session_id = ctx.id,
@@ -572,11 +645,22 @@ async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyho
         "tts stream finished"
     );
     send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
+    let llm_reply = std::mem::take(&mut *collected_text.lock().unwrap());
+    tracing::info!(
+        session_id = ctx.id,
+        chars = llm_reply.chars().count(),
+        text = %llm_reply,
+        total_elapsed_ms = pipeline_started.elapsed().as_millis(),
+        "llm reply"
+    );
     tracing::debug!(
         session_id = ctx.id,
         total_elapsed_ms = pipeline_started.elapsed().as_millis(),
         "pipeline finished"
     );
+    if let Some(llm) = llm_guard.take() {
+        state.lock().await.llm = Some(llm);
+    }
     Ok(())
 }
 
@@ -622,8 +706,18 @@ fn instrument_llm_stream(
     })
 }
 
+fn tee_collect_text(mut input: TextStream, sink: Arc<StdMutex<String>>) -> TextStream {
+    Box::pin(try_stream! {
+        while let Some(chunk) = input.next().await {
+            let chunk = chunk?;
+            sink.lock().unwrap().push_str(&chunk);
+            yield chunk;
+        }
+    })
+}
+
 async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, send_stop: bool) {
-    let (pipeline, mut asr, listen_timeout) = {
+    let (pipeline, mut asr, listen_timeout, llm) = {
         let mut guard = state.lock().await;
         guard.listening = false;
         guard.already_triggered = false;
@@ -636,8 +730,14 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
             guard.pipeline.take(),
             guard.asr.take(),
             guard.listen_timeout.take(),
+            guard.llm.take(),
         )
     };
+    if let Some(mut llm) = llm {
+        llm.abort().await;
+        // Reinsert so the same session can be reused for the next prompt.
+        state.lock().await.llm = Some(llm);
+    }
 
     if let Some(listen_timeout) = listen_timeout {
         listen_timeout.abort();

@@ -20,7 +20,35 @@ use crate::{
 use super::{TextStream, TtsEvent, TtsService, TtsStream};
 
 const DEFAULT_ENDPOINT: &str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection";
-const DEFAULT_RESOURCE_ID: &str = "seed-tts-2.0";
+
+/// Volcengine TTS resource IDs by voice family. Mapping per the official docs:
+///
+/// - `seed-icl-2.0` — voice clone 2.0 (`S_*` speakers)
+/// - `seed-tts-2.0` — stock 2.0 voices (`*_uranus_bigtts`, `saturn_*`)
+/// - `seed-tts-1.0` — stock 1.0 voices (`*_moon_bigtts`, `*_mars_bigtts`, `ICL_*`)
+///
+/// Mixing a voice with the wrong resource ID returns error `55000000: resource ID
+/// is mismatched with speaker related resource`. We derive the resource ID from
+/// the speaker name so callers don't have to track this themselves.
+fn derive_resource_id(voice_type: &str) -> Result<&'static str> {
+    if voice_type.starts_with("S_") || voice_type.starts_with("s_") {
+        Ok("seed-icl-2.0")
+    } else if voice_type.contains("_uranus_bigtts") || voice_type.starts_with("saturn_") {
+        Ok("seed-tts-2.0")
+    } else if voice_type.contains("_moon_bigtts")
+        || voice_type.contains("_mars_bigtts")
+        || voice_type.starts_with("ICL_")
+        || voice_type.starts_with("icl_")
+    {
+        Ok("seed-tts-1.0")
+    } else {
+        bail!(
+            "cannot derive volcengine tts resource_id from voice_type={voice_type:?}; \
+             expected a clone id (S_*), a stock 2.0 voice (*_uranus_bigtts / saturn_*), \
+             or a stock 1.0 voice (*_moon_bigtts / *_mars_bigtts / ICL_*)"
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct VolcengineTtsConfig {
@@ -42,7 +70,7 @@ impl VolcengineTtsConfig {
         }
 
         let voice_type = required_env("VOLCENGINE_TTS_VOICE_TYPE")?;
-        let resource_id = env_or("VOLCENGINE_TTS_RESOURCE_ID", DEFAULT_RESOURCE_ID);
+        let resource_id = derive_resource_id(&voice_type)?.to_string();
 
         Ok(Some(Self {
             api_key: required_env_any(&["VOLCENGINE_TTS_API_KEY", "VOLCENGINE_API_KEY"])?,
