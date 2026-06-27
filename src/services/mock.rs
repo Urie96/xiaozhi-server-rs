@@ -89,10 +89,3 @@ impl TtsService for MockTts {
         })
     }
 }
-
-#[derive(Clone, Debug, Default)]
-pub struct MockServices {
-    pub asr: MockAsr,
-    pub llm: MockLlm,
-    pub tts: MockTts,
-}

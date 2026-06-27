@@ -20,18 +20,22 @@ use tower_http::trace::TraceLayer;
 use crate::{
     config::Config,
     protocol::BinaryProtocolVersion,
+    services::ServiceBundle,
     session::{self, SessionMeta},
 };
 
 #[derive(Clone)]
 pub struct AppState {
     config: Arc<Config>,
+    services: ServiceBundle,
 }
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let bind = config.bind;
+    let services = ServiceBundle::from_env().context("initialize services")?;
     let state = AppState {
         config: Arc::new(config),
+        services,
     };
 
     let app = Router::new()
@@ -165,8 +169,9 @@ async fn ws_handler(
         "websocket upgrade accepted"
     );
 
+    let services = state.services.clone();
     ws.on_upgrade(move |socket: WebSocket| {
-        session::handle_websocket(socket, protocol_version, meta)
+        session::handle_websocket(socket, protocol_version, meta, services)
     })
     .into_response()
 }

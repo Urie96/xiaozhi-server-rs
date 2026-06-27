@@ -10,10 +10,9 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::services::AsrService;
 use crate::{
     protocol::{self, AudioFrame, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
-    services::{LlmService, TtsEvent, TtsService, mock::MockServices},
+    services::{ServiceBundle, TtsEvent},
 };
 
 const MOCK_ASR_TRIGGER_FRAMES: usize = 20;
@@ -45,13 +44,14 @@ struct SessionContext {
     id: String,
     version: Arc<Mutex<BinaryProtocolVersion>>,
     tx: mpsc::Sender<Outbound>,
-    services: Arc<MockServices>,
+    services: ServiceBundle,
 }
 
 pub async fn handle_websocket(
     socket: WebSocket,
     protocol_version: BinaryProtocolVersion,
     meta: SessionMeta,
+    services: ServiceBundle,
 ) {
     let session_id = Uuid::new_v4().to_string();
     tracing::info!(
@@ -96,7 +96,7 @@ pub async fn handle_websocket(
         id: session_id.clone(),
         version: Arc::new(Mutex::new(protocol_version)),
         tx: out_tx.clone(),
-        services: Arc::new(MockServices::default()),
+        services,
     };
     let state = Arc::new(Mutex::new(SessionState::default()));
 
