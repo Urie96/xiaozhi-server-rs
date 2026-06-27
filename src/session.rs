@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
@@ -26,7 +27,16 @@ use crate::{
 };
 
 const CLIENT_SAMPLE_RATE: u32 = 16_000;
-const DEFAULT_LISTEN_MAX_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_LISTEN_MAX_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Fixed-size PCM ring buffer used as a pre-roll for ASR: it keeps the most
+/// recent ~1 second of decoded PCM samples so that when VAD finally confirms
+/// speech onset, ASR receives the audio leading up to (and including) the
+/// trigger frame, instead of starting from the trigger point and missing the
+/// first syllable.
+///
+/// 1 second @ 16 kHz mono = 16 000 samples of i16 (~32 KB).
+const PCM_RING_BUFFER_SAMPLES: usize = 16_000;
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -49,12 +59,48 @@ struct SessionState {
     asr: Option<Box<dyn AsrStream>>,
     audio_decoder: Option<OpusPcmDecoder>,
     vad: Option<SileroVadStream>,
+    /// Holds the most recent PCM samples (FIFO, fixed capacity) until VAD
+    /// triggers, so the ASR session can be primed with the leading audio.
+    pcm_ring_buffer: Option<PcmRingBuffer>,
     listen_timeout: Option<JoinHandle<()>>,
     pipeline: Option<JoinHandle<()>>,
     listen_started_at: Option<Instant>,
     first_audio_logged: bool,
     input_frames: u64,
     llm: Option<Box<dyn LlmSession>>,
+}
+
+/// Fixed-capacity FIFO ring buffer for `i16` PCM samples.
+///
+/// Internally backed by `VecDeque` for simple push/pop-front semantics. The
+/// capacity is fixed; pushing past it evicts the oldest sample.
+#[derive(Debug)]
+struct PcmRingBuffer {
+    storage: VecDeque<i16>,
+    capacity: usize,
+}
+
+impl PcmRingBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            storage: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, samples: &[i16]) {
+        for &sample in samples {
+            if self.storage.len() == self.capacity {
+                self.storage.pop_front();
+            }
+            self.storage.push_back(sample);
+        }
+    }
+
+    /// Return all currently-buffered samples in chronological order.
+    fn drain(&self) -> Vec<i16> {
+        self.storage.iter().copied().collect()
+    }
 }
 
 #[derive(Clone)]
@@ -230,94 +276,71 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
         "listen" => match incoming.state() {
             Some("start") => {
                 abort_active(ctx, state, true).await;
-                let asr_start = Instant::now();
-                tracing::debug!(session_id = ctx.id, "starting asr stream");
-                match ctx.services.asr.start_stream().await {
-                    Ok(mut asr) => {
-                        tracing::debug!(
-                            session_id = ctx.id,
-                            elapsed_ms = asr_start.elapsed().as_millis(),
-                            "asr stream started"
-                        );
-
-                        let audio_decoder = match OpusPcmDecoder::new(CLIENT_SAMPLE_RATE) {
-                            Ok(decoder) => decoder,
-                            Err(err) => {
-                                let error_chain = format_error_chain(err.as_ref());
-                                tracing::warn!(
-                                    session_id = ctx.id,
-                                    error_chain,
-                                    "failed to create opus decoder for input audio"
-                                );
-                                asr.abort().await;
-                                return true;
-                            }
-                        };
-
-                        let vad = match ctx
-                            .services
-                            .vad
-                            .as_ref()
-                            .map(|vad| vad.start_stream())
-                            .transpose()
-                        {
-                            Ok(vad) => vad,
-                            Err(err) => {
-                                let error_chain = format_error_chain(err.as_ref());
-                                tracing::warn!(
-                                    session_id = ctx.id,
-                                    error_chain,
-                                    "failed to start VAD stream"
-                                );
-                                asr.abort().await;
-                                return true;
-                            }
-                        };
-
-                        let max_timeout = listen_max_timeout();
-                        let timeout_ctx = ctx.clone();
-                        let timeout_state = state.clone();
-                        let listen_timeout = tokio::spawn(async move {
-                            sleep(max_timeout).await;
-                            finish_listening(
-                                timeout_ctx,
-                                timeout_state,
-                                "maximum listen timeout",
-                                false,
-                            )
-                            .await;
-                        });
-
-                        let mut guard = state.lock().await;
-                        guard.listening = true;
-                        guard.already_triggered = false;
-                        guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
-                        guard.asr = Some(asr);
-                        guard.audio_decoder = Some(audio_decoder);
-                        guard.vad = vad;
-                        guard.listen_started_at = Some(Instant::now());
-                        guard.first_audio_logged = false;
-                        guard.input_frames = 0;
-                        if let Some(old) = guard.listen_timeout.replace(listen_timeout) {
-                            old.abort();
-                        }
-                        tracing::info!(
-                            session_id = ctx.id,
-                            mode = ?guard.listen_mode,
-                            vad_enabled = guard.vad.is_some(),
-                            timeout_ms = max_timeout.as_millis(),
-                            "listen started"
-                        );
-                    }
+                let audio_decoder = match OpusPcmDecoder::new(CLIENT_SAMPLE_RATE) {
+                    Ok(decoder) => decoder,
                     Err(err) => {
                         let error_chain = format_error_chain(err.as_ref());
                         tracing::warn!(
                             session_id = ctx.id,
                             error_chain,
-                            "failed to start asr stream"
+                            "failed to create opus decoder for input audio"
                         );
+                        return true;
                     }
+                };
+
+                let vad = match ctx
+                    .services
+                    .vad
+                    .as_ref()
+                    .map(|vad| vad.start_stream())
+                    .transpose()
+                {
+                    Ok(vad) => vad,
+                    Err(err) => {
+                        let error_chain = format_error_chain(err.as_ref());
+                        tracing::warn!(
+                            session_id = ctx.id,
+                            error_chain,
+                            "failed to start VAD stream"
+                        );
+                        return true;
+                    }
+                };
+
+                let max_timeout = listen_max_timeout();
+                let timeout_ctx = ctx.clone();
+                let timeout_state = state.clone();
+                let listen_timeout = tokio::spawn(async move {
+                    sleep(max_timeout).await;
+                    finish_listening(timeout_ctx, timeout_state, "maximum listen timeout", false)
+                        .await;
+                });
+
+                let mut guard = state.lock().await;
+                guard.listening = true;
+                guard.already_triggered = false;
+                guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
+                // ASR is intentionally NOT started here. It will be opened on
+                // VAD `SpeechStart` so the first ASR bytes include the pre-roll
+                // audio that the VAD just confirmed.
+                guard.asr = None;
+                guard.audio_decoder = Some(audio_decoder);
+                guard.vad = vad;
+                guard.pcm_ring_buffer = Some(PcmRingBuffer::new(PCM_RING_BUFFER_SAMPLES));
+                guard.listen_started_at = Some(Instant::now());
+                guard.first_audio_logged = false;
+                guard.input_frames = 0;
+                if let Some(old) = guard.listen_timeout.replace(listen_timeout) {
+                    old.abort();
                 }
+                tracing::info!(
+                    session_id = ctx.id,
+                    mode = ?guard.listen_mode,
+                    vad_enabled = guard.vad.is_some(),
+                    timeout_ms = max_timeout.as_millis(),
+                    "listen started"
+                );
             }
             Some("stop") => {
                 finish_listening(ctx.clone(), state.clone(), "listen stopped", true).await;
@@ -406,16 +429,62 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
                 "failed to push pcm to asr stream"
             );
         }
+    } else if let Some(ring) = guard.pcm_ring_buffer.as_mut() {
+        // Pre-roll: ASR is not yet open, accumulate PCM so it can be
+        // drained into ASR when VAD finally confirms speech onset.
+        ring.push(&samples);
     }
 
     let mut finish_reason = None;
+    let mut asr_open_failure: Option<String> = None;
     if let Some(vad) = guard.vad.as_mut() {
         match vad.accept_pcm(&samples) {
             Ok(events) => {
                 for event in events {
                     match event {
                         VadEvent::SpeechStart { sample } => {
-                            tracing::debug!(session_id = ctx.id, sample, "VAD speech started");
+                            tracing::info!(
+                                session_id = ctx.id,
+                                sample,
+                                "VAD speech started; opening ASR"
+                            );
+                            match ctx.services.asr.start_stream().await {
+                                Ok(mut asr) => {
+                                    if let Some(ring) = guard.pcm_ring_buffer.take() {
+                                        let prefill = ring.drain();
+                                        if !prefill.is_empty() {
+                                            tracing::debug!(
+                                                session_id = ctx.id,
+                                                samples = prefill.len(),
+                                                "draining pre-roll PCM to ASR"
+                                            );
+                                            if let Err(err) = asr.push_pcm(&prefill).await {
+                                                let error_chain = format_error_chain(err.as_ref());
+                                                tracing::warn!(
+                                                    session_id = ctx.id,
+                                                    error_chain,
+                                                    "failed to prefill ASR with pcm"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    guard.asr = Some(asr);
+                                    // VAD has confirmed speech; the listen
+                                    // timeout is no longer needed as a backstop.
+                                    if let Some(timeout) = guard.listen_timeout.take() {
+                                        timeout.abort();
+                                    }
+                                }
+                                Err(err) => {
+                                    let error_chain = format_error_chain(err.as_ref());
+                                    tracing::error!(
+                                        session_id = ctx.id,
+                                        error_chain,
+                                        "failed to start ASR on VAD trigger"
+                                    );
+                                    asr_open_failure = Some(error_chain);
+                                }
+                            }
                         }
                         VadEvent::SpeechEnd {
                             start_sample,
@@ -443,6 +512,14 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
     if let Some(reason) = finish_reason {
         finish_listening(ctx.clone(), state.clone(), reason, true).await;
     }
+    if let Some(error_chain) = asr_open_failure {
+        tracing::error!(
+            session_id = ctx.id,
+            error_chain,
+            "aborting listen due to ASR open failure"
+        );
+        abort_active(ctx, state, false).await;
+    }
 }
 
 async fn finish_listening(
@@ -467,6 +544,7 @@ async fn finish_listening(
             guard.input_frames = 0;
             guard.audio_decoder = None;
             guard.vad = None;
+            guard.pcm_ring_buffer = None;
             (
                 guard.asr.take(),
                 if abort_timeout {
@@ -539,6 +617,19 @@ async fn run_pipeline(
         text_chars = text.chars().count(),
         "asr finish returned final text"
     );
+
+    if text.trim().is_empty() {
+        tracing::info!(
+            session_id = ctx.id,
+            total_elapsed_ms = pipeline_started.elapsed().as_millis(),
+            "asr returned empty text; skipping llm and returning to listen"
+        );
+        // Send tts.stop so the client transitions out of the (never-entered)
+        // speaking state and re-enters listening. In auto mode this will
+        // trigger a fresh listen.start from the client.
+        send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
+        return Ok(());
+    }
 
     send_json(&ctx, protocol::stt(&ctx.id, &text)).await;
     send_json(&ctx, protocol::llm_emotion(&ctx.id, "happy", "😊")).await;
@@ -723,6 +814,7 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
         guard.already_triggered = false;
         guard.audio_decoder = None;
         guard.vad = None;
+        guard.pcm_ring_buffer = None;
         guard.listen_started_at = None;
         guard.first_audio_logged = false;
         guard.input_frames = 0;

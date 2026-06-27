@@ -9,6 +9,12 @@ const DEFAULT_FRAME_SIZE_MS: usize = 32;
 const DEFAULT_MODEL_PATH: &str = "models/silero_vad.onnx";
 const FALLBACK_MODEL_PATH: &str = "/home/urie/temp/silero-vad/src/silero_vad/data/silero_vad.onnx";
 
+/// Consecutive frames above threshold required to confirm a speech onset.
+///
+/// 5 × 32ms = 160ms, which filters out brief noise bursts (keyboard, door
+/// slam, etc.) that may push speech_prob above 0.5 for a single frame.
+const REQUIRED_CONSECUTIVE_FRAMES: u8 = 5;
+
 #[derive(Clone, Debug)]
 pub struct SileroVadConfig {
     pub model_path: PathBuf,
@@ -237,6 +243,9 @@ struct VadState {
     prev_end: usize,
     triggered: bool,
     current_start: usize,
+    /// Counts consecutive frames with speech_prob above threshold while not yet
+    /// triggered. Reset on any frame below threshold.
+    pending_count: u8,
 }
 
 impl VadState {
@@ -255,16 +264,29 @@ impl VadState {
                 }
             }
             if !self.triggered {
-                self.triggered = true;
-                self.current_start = self
-                    .current_sample
-                    .saturating_sub(params.frame_size_samples);
-                return Some(VadEvent::SpeechStart {
-                    sample: self.current_start,
-                });
+                // Require `REQUIRED_CONSECUTIVE_FRAMES` consecutive frames above
+                // threshold before treating the onset as real speech. This
+                // filters out single-frame noise bursts that would otherwise
+                // cause a spurious SpeechStart -> SpeechEnd cycle ~600ms later.
+                self.pending_count = self.pending_count.saturating_add(1);
+                if self.pending_count >= REQUIRED_CONSECUTIVE_FRAMES {
+                    self.triggered = true;
+                    self.current_start = self
+                        .current_sample
+                        .saturating_sub(params.frame_size_samples);
+                    self.pending_count = 0;
+                    return Some(VadEvent::SpeechStart {
+                        sample: self.current_start,
+                    });
+                }
+                return None;
             }
             return None;
         }
+
+        // Below threshold: reset pending counter so a future burst has to
+        // accumulate `REQUIRED_CONSECUTIVE_FRAMES` from scratch.
+        self.pending_count = 0;
 
         if self.triggered
             && (self.current_sample.saturating_sub(self.current_start)) as f32
@@ -357,19 +379,78 @@ mod tests {
         };
         let mut state = VadState::default();
 
+        // Single frame above threshold must NOT trigger (debounce).
+        assert_eq!(state.update(&params, 0.8), None);
+        // 4 frames are still not enough.
+        for _ in 0..3 {
+            assert_eq!(state.update(&params, 0.8), None);
+        }
+        // 5th consecutive frame confirms the onset.
+        // current_sample has advanced 5 * 512 = 2560; current_start = 2560 - 512 = 2048.
         assert_eq!(
             state.update(&params, 0.8),
-            Some(VadEvent::SpeechStart { sample: 0 })
+            Some(VadEvent::SpeechStart { sample: 2048 })
         );
         assert_eq!(state.update(&params, 0.8), None);
+        // Silence begins; first silent frame sets temp_end = current_sample = 3584.
         assert_eq!(state.update(&params, 0.1), None);
+        // 512 more silent samples (current_sample = 4096), still under 1024 threshold.
         assert_eq!(state.update(&params, 0.1), None);
+        // 1024 silent samples accumulated since temp_end (4608 - 3584 = 1024) -> end speech.
         assert_eq!(
             state.update(&params, 0.1),
             Some(VadEvent::SpeechEnd {
-                start_sample: 0,
-                end_sample: 1536
+                start_sample: 2048,
+                end_sample: 3584
             })
         );
+    }
+
+    #[test]
+    fn vad_state_resets_pending_count_on_silence() {
+        let params = VadParams {
+            threshold: 0.5,
+            frame_size_samples: 512,
+            min_speech_samples: 512,
+            max_speech_samples: 16_000.0,
+            min_silence_samples: 1024,
+            min_silence_samples_at_max_speech: 1568,
+        };
+        let mut state = VadState::default();
+
+        // 3 frames above threshold, then a single silent frame resets the counter.
+        for _ in 0..3 {
+            assert_eq!(state.update(&params, 0.8), None);
+        }
+        assert_eq!(state.update(&params, 0.1), None);
+
+        // After reset, 3 more frames must NOT trigger (would have triggered
+        // without the reset).
+        for _ in 0..3 {
+            assert_eq!(state.update(&params, 0.8), None);
+        }
+        assert!(!state.triggered);
+    }
+
+    #[test]
+    fn vad_state_does_not_trigger_on_transient_noise() {
+        let params = VadParams {
+            threshold: 0.5,
+            frame_size_samples: 512,
+            min_speech_samples: 512,
+            max_speech_samples: 16_000.0,
+            min_silence_samples: 1024,
+            min_silence_samples_at_max_speech: 1568,
+        };
+        let mut state = VadState::default();
+
+        // Simulate a noise burst: 1 frame above, then back to silence.
+        assert_eq!(state.update(&params, 0.8), None);
+        assert_eq!(state.update(&params, 0.1), None);
+        // Many more silent frames must not emit anything.
+        for _ in 0..20 {
+            assert_eq!(state.update(&params, 0.1), None);
+        }
+        assert!(!state.triggered);
     }
 }
