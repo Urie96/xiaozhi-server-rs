@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Notify, mpsc},
     task::JoinHandle,
     time::{Duration, sleep},
 };
@@ -67,7 +67,23 @@ struct SessionState {
     listen_started_at: Option<Instant>,
     first_audio_logged: bool,
     input_frames: u64,
-    llm: Option<Box<dyn LlmSession>>,
+    /// Owns the LLM session for the lifetime of the WebSocket connection.
+    ///
+    /// Held behind `Arc<Mutex<...>>` so the in-flight `run_pipeline` task can
+    /// borrow it (calling `chat_stream` synchronously under the lock) without
+    /// moving it out of `SessionState`. This is critical: if the pipeline
+    /// task is later notified to abort, it must NOT be holding the only
+    /// reference to the LLM, because for `pi-rpc` the LLM is a live child
+    /// process and dropping it would kill the process (and lose the
+    /// session). The lock is held only for the synchronous `chat_stream`
+    /// call; the lock is never held across an `await`.
+    llm: Arc<Mutex<Option<Box<dyn LlmSession>>>>,
+    /// Notified by `abort_active` so the running `run_pipeline` task can
+    /// observe the abort, emit a `tts.stop`, and exit cleanly. The pipeline
+    /// task is never cancelled with `JoinHandle::abort`, because that
+    /// would drop its stack-locals (including any LLM handle) and kill the
+    /// underlying pi child process.
+    abort_notify: Arc<Notify>,
 }
 
 /// Fixed-capacity FIFO ring buffer for `i16` PCM samples.
@@ -142,6 +158,7 @@ pub async fn handle_websocket(
             None
         }
     };
+    let llm_slot = Arc::new(Mutex::new(llm));
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(128);
@@ -197,7 +214,8 @@ pub async fn handle_websocket(
         services,
     };
     let state = Arc::new(Mutex::new(SessionState {
-        llm,
+        llm: llm_slot,
+        abort_notify: Arc::new(Notify::new()),
         ..SessionState::default()
     }));
 
@@ -231,9 +249,12 @@ pub async fn handle_websocket(
     }
 
     abort_active(&ctx, &state, false).await;
-    if let Some(mut llm) = state.lock().await.llm.take() {
-        llm.shutdown().await;
-        tracing::info!(session_id, "llm session shutdown complete");
+    {
+        let llm_slot = state.lock().await.llm.clone();
+        if let Some(mut llm) = llm_slot.lock().await.take() {
+            llm.shutdown().await;
+            tracing::info!(session_id, "llm session shutdown complete");
+        }
     }
     drop(out_tx);
     if let Err(err) = writer.await {
@@ -596,7 +617,23 @@ async fn trigger_conversation(
 
     let mut guard = state.lock().await;
     if let Some(old) = guard.pipeline.replace(handle) {
-        old.abort();
+        // `old` is the previous pipeline task. Under normal flow
+        // `abort_active` already notified it to exit cleanly before we
+        // got here, so this should normally be a no-op `await` of an
+        // already-finished task. The `abort()` is a belt-and-braces
+        // fallback for the rare race where a new listen round started
+        // before the previous one finished (e.g. a client sends
+        // `listen.start` while a previous `listen.stop` is still in
+        // flight). Even in that case the LLM now lives in
+        // `state.llm` (not on the pipeline stack), so cancelling the
+        // task no longer kills the pi child process.
+        if !old.is_finished() {
+            tracing::debug!(
+                session_id = ctx.id,
+                "previous pipeline still running while starting a new one; aborting it"
+            );
+            old.abort();
+        }
     }
 }
 
@@ -608,8 +645,31 @@ async fn run_pipeline(
     let pipeline_started = Instant::now();
     tracing::debug!(session_id = ctx.id, "pipeline timing started");
 
+    // Abort notifier is cloned here and again inside the loop. We hold a
+    // `Notified` future for the *outer* wait (during ASR finish) so that an
+    // abort arriving before the pipeline reaches the TTS loop is also
+    // observed.
+    let abort_notify = {
+        let guard = state.lock().await;
+        guard.abort_notify.clone()
+    };
+
     let asr_finish_started = Instant::now();
-    let text = asr.finish().await?;
+    let asr_result = tokio::select! {
+        biased;
+        _ = abort_notify.notified() => {
+            tracing::info!(
+                session_id = ctx.id,
+                "pipeline aborted during asr finish"
+            );
+            // Drain the asr stream so its underlying connection is closed
+            // cleanly even though we won't run the LLM/TTS pipeline.
+            let _ = asr.abort().await;
+            return Ok(());
+        }
+        result = asr.finish() => result,
+    };
+    let text = asr_result?;
     tracing::debug!(
         session_id = ctx.id,
         elapsed_ms = asr_finish_started.elapsed().as_millis(),
@@ -641,26 +701,33 @@ async fn run_pipeline(
     );
 
     let llm_started = Instant::now();
-    let mut llm_guard = {
-        let mut guard = state.lock().await;
-        guard.llm.take()
-    };
-    let raw_llm_stream = match llm_guard.as_mut() {
-        Some(llm) => llm.chat_stream(text),
-        None => {
-            tracing::error!(
-                session_id = ctx.id,
-                "llm session not available; aborting conversation pipeline"
-            );
-            let _ = ctx
-                .tx
-                .send(Outbound::Text(serde_json::json!({
-                    "session_id": ctx.id,
-                    "type": "error",
-                    "message": "llm session not available"
-                })))
-                .await;
-            return Ok(());
+    // Borrow the LLM session under the lock for the synchronous
+    // `chat_stream` call only. The lock is dropped as soon as we have the
+    // `TextStream` in hand; we never hold the lock across an `await`. This
+    // is what guarantees `abort_active` can always reach the LLM to send an
+    // `abort` command and that the LLM (and its pi child process) is never
+    // dropped because the pipeline task was cancelled.
+    let llm_slot = state.lock().await.llm.clone();
+    let raw_llm_stream = {
+        let mut guard = llm_slot.lock().await;
+        match guard.as_mut() {
+            Some(llm) => llm.chat_stream(text),
+            None => {
+                tracing::error!(
+                    session_id = ctx.id,
+                    "llm session not available; aborting conversation pipeline"
+                );
+                drop(guard);
+                let _ = ctx
+                    .tx
+                    .send(Outbound::Text(serde_json::json!({
+                        "session_id": ctx.id,
+                        "type": "error",
+                        "message": "llm session not available"
+                    })))
+                    .await;
+                return Ok(());
+            }
         }
     };
     let llm_stream = instrument_llm_stream(
@@ -685,9 +752,34 @@ async fn run_pipeline(
     let mut audio_frames = 0u64;
     let mut first_sentence_logged = false;
     let mut first_audio_logged = false;
+    let mut aborted = false;
 
-    while let Some(event) = tts_stream.next().await {
-        match event? {
+    // TTS event loop with abort awareness. We `select!` on the next TTS
+    // event vs. the abort notifier so an abort mid-pipeline is observed
+    // promptly without cancelling the task (and thus without dropping the
+    // LLM handle or killing the pi child process).
+    loop {
+        let next_event = tts_stream.next();
+        tokio::pin!(next_event);
+        let event = tokio::select! {
+            biased;
+            _ = abort_notify.notified() => {
+                tracing::info!(
+                    session_id = ctx.id,
+                    audio_frames,
+                    "pipeline aborted mid-tts"
+                );
+                aborted = true;
+                break;
+            }
+            event = &mut next_event => event,
+        };
+        let event = match event {
+            Some(Ok(event)) => event,
+            Some(Err(err)) => return Err(err),
+            None => break,
+        };
+        match event {
             TtsEvent::SentenceStart(text) => {
                 sentence_events = sentence_events.saturating_add(1);
                 if !first_sentence_logged {
@@ -733,27 +825,34 @@ async fn run_pipeline(
         total_elapsed_ms = pipeline_started.elapsed().as_millis(),
         sentence_events,
         audio_frames,
+        aborted,
         "tts stream finished"
     );
+    // Always emit `tts.stop` on the way out, including the abort path, so
+    // the client reliably transitions out of the speaking state. On normal
+    // completion this is the pair of `tts.start` we emitted earlier; on
+    // abort it cancels whatever audio the client was already playing.
     send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
-    let llm_reply = std::mem::take(&mut *collected_text.lock().unwrap());
-    tracing::info!(
-        session_id = ctx.id,
-        chars = llm_reply.chars().count(),
-        text = %llm_reply,
-        total_elapsed_ms = pipeline_started.elapsed().as_millis(),
-        "llm reply"
-    );
+    if !aborted {
+        let llm_reply = std::mem::take(&mut *collected_text.lock().unwrap());
+        tracing::info!(
+            session_id = ctx.id,
+            chars = llm_reply.chars().count(),
+            text = %llm_reply,
+            total_elapsed_ms = pipeline_started.elapsed().as_millis(),
+            "llm reply"
+        );
+    }
     tracing::debug!(
         session_id = ctx.id,
         total_elapsed_ms = pipeline_started.elapsed().as_millis(),
         "pipeline finished"
     );
-    if let Some(llm) = llm_guard.take() {
-        state.lock().await.llm = Some(llm);
-    }
     Ok(())
 }
+
+// (helper removed: we now `tokio::pin!` the next-event future inline in
+//  `run_pipeline` so the abort notifier can race it directly.)
 
 fn instrument_llm_stream(
     session_id: String,
@@ -808,7 +907,16 @@ fn tee_collect_text(mut input: TextStream, sink: Arc<StdMutex<String>>) -> TextS
 }
 
 async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, send_stop: bool) {
-    let (pipeline, mut asr, listen_timeout, llm) = {
+    // Gather the things we need to talk to. We deliberately do NOT take
+    // `state.llm` here: the LLM session lives in `state.llm` for the
+    // lifetime of the WebSocket connection, and we only borrow it to send
+    // an abort command. This is the fix for the `llm session not
+    // available` bug: previously the pipeline task would take the LLM out
+    // of state, and aborting the pipeline task would drop it (killing the
+    // pi child process via `kill_on_drop`). Now the LLM stays put, the
+    // pipeline task is notified (not cancelled) to exit cleanly, and the
+    // pi session survives across aborts.
+    let (abort_notify, mut asr) = {
         let mut guard = state.lock().await;
         guard.listening = false;
         guard.already_triggered = false;
@@ -818,37 +926,42 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
         guard.listen_started_at = None;
         guard.first_audio_logged = false;
         guard.input_frames = 0;
-        (
-            guard.pipeline.take(),
-            guard.asr.take(),
-            guard.listen_timeout.take(),
-            guard.llm.take(),
-        )
+        if let Some(timeout) = guard.listen_timeout.take() {
+            timeout.abort();
+        }
+        let asr = guard.asr.take();
+        (guard.abort_notify.clone(), asr)
     };
-    if let Some(mut llm) = llm {
-        llm.abort().await;
-        // Reinsert so the same session can be reused for the next prompt.
-        state.lock().await.llm = Some(llm);
-    }
 
-    if let Some(listen_timeout) = listen_timeout {
-        listen_timeout.abort();
-    }
+    // Notify the pipeline task so it can stop at the next TTS event
+    // boundary, emit a `tts.stop`, and exit. We don't cancel the task
+    // because that would drop its stack-locals and could leave the
+    // websocket writer in a weird state. The pipeline task will itself
+    // emit `tts.stop` on its way out (see `run_pipeline`).
+    abort_notify.notify_waiters();
 
-    if let Some(handle) = pipeline {
-        if !handle.is_finished() {
-            handle.abort();
-            tracing::info!(session_id = ctx.id, "conversation pipeline aborted");
-            if send_stop {
-                send_json(ctx, protocol::tts_stop(&ctx.id)).await;
-            }
+    // Send abort to the LLM. This is the path that actually interrupts the
+    // current prompt in pi (via `{"type":"abort"}` on stdin) while
+    // keeping the pi child process and session alive.
+    {
+        let llm_slot = state.lock().await.llm.clone();
+        let mut llm_guard = llm_slot.lock().await;
+        if let Some(llm) = llm_guard.as_mut() {
+            llm.abort().await;
         }
     }
 
+    // Abort the in-flight ASR stream (if any). This is per-listen-round
+    // state, not the long-lived LLM.
     if let Some(asr) = asr.as_mut() {
         asr.abort().await;
         tracing::info!(session_id = ctx.id, "asr stream aborted");
     }
+
+    if send_stop {
+        send_json(ctx, protocol::tts_stop(&ctx.id)).await;
+    }
+    tracing::info!(session_id = ctx.id, "abort dispatched");
 }
 
 async fn send_json(ctx: &SessionContext, value: Value) {

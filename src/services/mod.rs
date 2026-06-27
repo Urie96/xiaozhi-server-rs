@@ -53,6 +53,18 @@ pub struct LlmSessionMeta {
 
 #[async_trait]
 pub trait LlmSession: Send + 'static {
+    /// Begin a chat completion and return a stream of text deltas.
+    ///
+    /// **Implementor contract (do not violate):** this method MUST be
+    /// synchronous (no `.await`) and MUST NOT be invoked while holding an
+    /// `Arc<Mutex<LlmSession>>` across an `await` point. The session
+    /// runtime relies on being able to call `abort()` at any time, which
+    /// requires being able to take the `LlmSession` lock without
+    /// contending with a pipeline task that is still parked inside
+    /// `chat_stream`. Implementations are expected to return a fresh
+    /// `TextStream` (typically backed by an internal channel) and
+    /// immediately return, with the actual LLM work driven by a
+    /// background task that has already been moved out of `&mut self`.
     fn chat_stream(&mut self, prompt: String) -> TextStream;
     async fn abort(&mut self);
     async fn shutdown(&mut self);
