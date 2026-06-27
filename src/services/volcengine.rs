@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_stream::try_stream;
@@ -13,8 +13,8 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use crate::{
-    audio::ogg_opus::OggOpusPacketizer,
-    protocol::{AudioFrame, SERVER_FRAME_DURATION_MS, SERVER_SAMPLE_RATE},
+    audio::{ogg_opus::OggOpusPacketizer, opus_duration},
+    protocol::{AudioFrame, SERVER_SAMPLE_RATE},
 };
 
 use super::{TextStream, TtsEvent, TtsService, TtsStream};
@@ -29,6 +29,7 @@ pub struct VolcengineTtsConfig {
     pub voice_type: String,
     pub endpoint: String,
     pub encoding: VolcengineAudioEncoding,
+    pub prebuffer_ms: u64,
 }
 
 impl VolcengineTtsConfig {
@@ -49,6 +50,7 @@ impl VolcengineTtsConfig {
             voice_type,
             endpoint: env_or("VOLCENGINE_TTS_ENDPOINT", DEFAULT_ENDPOINT),
             encoding: VolcengineAudioEncoding::from_env()?,
+            prebuffer_ms: env_u64("VOLCENGINE_TTS_PREBUFFER_MS", 180),
         }))
     }
 }
@@ -194,6 +196,7 @@ impl VolcengineBidirectionalClient {
         .context("wait volcengine SessionStarted")?;
 
         let encoding = self.config.encoding;
+        let prebuffer = Duration::from_millis(self.config.prebuffer_ms);
         let writer_config = self.config;
         let writer_session_id = session_id.clone();
         let writer = AbortOnDrop::new(tokio::spawn(async move {
@@ -203,6 +206,8 @@ impl VolcengineBidirectionalClient {
         let stream = try_stream! {
             let mut demuxer = OggOpusPacketizer::new();
             let mut timestamp = 0u32;
+            let mut audio_start: Option<Instant> = None;
+            let mut play_position = Duration::ZERO;
 
             loop {
                 let Some(message) = timeout(Duration::from_secs(60), read.next())
@@ -225,8 +230,27 @@ impl VolcengineBidirectionalClient {
                         };
 
                         for payload in packets {
+                            let duration = opus_duration::packet_duration(&payload)
+                                .unwrap_or_else(|| Duration::from_millis(20));
+                            let start = *audio_start.get_or_insert_with(Instant::now);
+
+                            // Same idea as xiaozhi-server-go: keep a small client-side prebuffer,
+                            // then schedule frames by playback position. This avoids both firehose
+                            // drops and exact-per-packet sleeps that cause underruns/jitter.
+                            if play_position >= prebuffer {
+                                let target_elapsed = play_position
+                                    .checked_sub(prebuffer)
+                                    .unwrap_or_default();
+                                if let Some(delay) = target_elapsed.checked_sub(start.elapsed()) {
+                                    if !delay.is_zero() {
+                                        sleep(delay).await;
+                                    }
+                                }
+                            }
+
                             yield TtsEvent::Audio(AudioFrame { timestamp, payload });
-                            timestamp = timestamp.saturating_add(SERVER_FRAME_DURATION_MS);
+                            timestamp = timestamp.saturating_add(duration.as_millis().max(1) as u32);
+                            play_position += duration;
                         }
                     }
                     MsgType::FullServerResponse => {
@@ -257,6 +281,10 @@ impl VolcengineBidirectionalClient {
                     }
                     other => tracing::trace!(msg_type = ?other, "ignored volcengine tts message"),
                 }
+            }
+
+            if audio_start.is_some() && !play_position.is_zero() {
+                sleep(std::cmp::min(prebuffer, play_position)).await;
             }
 
             match writer.join().await {
@@ -660,4 +688,11 @@ fn env_or(name: &str, default: &str) -> String {
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(default)
 }

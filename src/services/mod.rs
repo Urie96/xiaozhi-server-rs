@@ -52,6 +52,7 @@ impl ServiceBundle {
                     resource_id = %config.resource_id,
                     voice_type = %config.voice_type,
                     encoding = ?config.encoding,
+                    prebuffer_ms = config.prebuffer_ms,
                     "using volcengine bidirectional tts"
                 );
                 Arc::new(VolcengineTts::new(config))
