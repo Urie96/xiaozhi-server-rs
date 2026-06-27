@@ -19,6 +19,7 @@ use crate::{
     },
     protocol::{self, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
     services::{AsrStream, ServiceBundle, TextStream, TtsEvent},
+    text_filter::filter_tts_text_stream,
 };
 
 const CLIENT_SAMPLE_RATE: u32 = 16_000;
@@ -508,7 +509,8 @@ async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyho
     );
 
     let tts_started = Instant::now();
-    let mut tts_stream = ctx.services.tts.synthesize_stream(llm_stream);
+    let tts_input = filter_tts_text_stream(llm_stream);
+    let mut tts_stream = ctx.services.tts.synthesize_stream(tts_input);
     tracing::debug!(
         session_id = ctx.id,
         total_elapsed_ms = pipeline_started.elapsed().as_millis(),
