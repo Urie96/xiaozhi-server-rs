@@ -1,4 +1,5 @@
 pub mod mock;
+pub mod openai;
 pub mod volcengine;
 pub mod volcengine_asr;
 
@@ -12,6 +13,7 @@ use crate::protocol::AudioFrame;
 
 use self::{
     mock::{MockAsr, MockLlm, MockTts},
+    openai::{OpenAiLlm, OpenAiLlmConfig},
     volcengine::{VolcengineTts, VolcengineTtsConfig},
     volcengine_asr::{VolcengineAsr, VolcengineAsrConfig},
 };
@@ -89,10 +91,23 @@ impl ServiceBundle {
             }
         };
 
-        Ok(Self {
-            asr,
-            llm: Arc::new(MockLlm),
-            tts,
-        })
+        let llm: Arc<dyn LlmService> = match OpenAiLlmConfig::from_env()? {
+            Some(config) => {
+                tracing::info!(
+                    base_url = %config.base_url,
+                    model = %config.model,
+                    disable_thinking = config.disable_thinking,
+                    thinking_style = ?config.thinking_style,
+                    "using OpenAI-compatible streaming llm"
+                );
+                Arc::new(OpenAiLlm::new(config))
+            }
+            None => {
+                tracing::info!("using mock llm");
+                Arc::new(MockLlm)
+            }
+        };
+
+        Ok(Self { asr, llm, tts })
     }
 }
