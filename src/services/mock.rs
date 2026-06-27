@@ -11,16 +11,37 @@ use crate::{
     protocol::{AudioFrame, SERVER_FRAME_DURATION_MS},
 };
 
-use super::{AsrService, LlmService, TextStream, TtsEvent, TtsService, TtsStream};
+use super::{AsrService, AsrStream, LlmService, TextStream, TtsEvent, TtsService, TtsStream};
 
 #[derive(Clone, Debug, Default)]
 pub struct MockAsr;
 
 #[async_trait]
 impl AsrService for MockAsr {
-    async fn recognize(&self, frames: &[AudioFrame]) -> Result<String> {
-        tracing::info!(frames = frames.len(), "mock asr recognized utterance");
+    async fn start_stream(&self) -> Result<Box<dyn AsrStream>> {
+        Ok(Box::new(MockAsrStream::default()))
+    }
+}
+
+#[derive(Debug, Default)]
+struct MockAsrStream {
+    frames: usize,
+}
+
+#[async_trait]
+impl AsrStream for MockAsrStream {
+    async fn push_audio(&mut self, _frame: AudioFrame) -> Result<()> {
+        self.frames += 1;
+        Ok(())
+    }
+
+    async fn finish(&mut self) -> Result<String> {
+        tracing::info!(frames = self.frames, "mock asr recognized utterance");
         Ok("你好小智".to_string())
+    }
+
+    async fn abort(&mut self) {
+        tracing::debug!(frames = self.frames, "mock asr stream aborted");
     }
 }
 

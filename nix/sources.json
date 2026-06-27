@@ -3,11 +3,11 @@
     "name": "arduino-indexes",
     "owner": "bouk",
     "repo": "arduino-indexes",
-    "rev": "fb5b19ace37b2cb9ecbc8f8e4713f7f84e05a73c",
-    "sha256": "0az3x8cqaj4n7caf07j5jrd4dbnb10paky1pgsxa5h3mq9nx5kii",
+    "rev": "e5b0e6c73a47643c39f1d567e9b47b2f602e7bf6",
+    "sha256": "06ds7014aijdcdnvssjqlk5hyh8ylcyp0f0k37668ny44p29aqvk",
     "type": "tarball",
-    "url": "https://github.com/bouk/arduino-indexes/archive/fb5b19ace37b2cb9ecbc8f8e4713f7f84e05a73c.tar.gz",
-    "version": "fb5b19ace37b2cb9ecbc8f8e4713f7f84e05a73c"
+    "url": "https://github.com/bouk/arduino-indexes/archive/e5b0e6c73a47643c39f1d567e9b47b2f602e7bf6.tar.gz",
+    "version": "e5b0e6c73a47643c39f1d567e9b47b2f602e7bf6"
   },
   "arduino-nix": {
     "name": "arduino-nix",
@@ -23,31 +23,31 @@
     "name": "nixpkgs",
     "owner": "NixOS",
     "repo": "nixpkgs",
-    "rev": "1306659b587dc277866c7b69eb97e5f07864d8c4",
-    "sha256": "1zlyra609xq3950j010dv0fzz2yjggfciprn1vmb8jjby1mv1798",
+    "rev": "e73de5be04e0eff4190a1432b946d469c794e7b4",
+    "sha256": "04csm31wfzrhmr0qrq74gay01cbx32b7phw540j13lqdry8casx4",
     "type": "tarball",
-    "url": "https://github.com/NixOS/nixpkgs/archive/1306659b587dc277866c7b69eb97e5f07864d8c4.tar.gz",
+    "url": "https://github.com/NixOS/nixpkgs/archive/e73de5be04e0eff4190a1432b946d469c794e7b4.tar.gz",
     "version": "nixos-unstable"
   },
   "nixpkgs-esp-dev": {
     "name": "nixpkgs-esp-dev",
     "owner": "mirrexagon",
     "repo": "nixpkgs-esp-dev",
-    "rev": "a9ee12a6c8235eb5a9d94934d3e79afac2103ffb",
-    "sha256": "1izydhpcl6mcn7pm1zm5x4n4g5kbggsqay8ynbpfpwic09v38bvk",
+    "rev": "5287d6e1ca9e15ebd5113c41b9590c468e1e001b",
+    "sha256": "12mhbc5r5k5ng2361184blfgn58hiqpla7mjrk6ppy0xjsnpaqa1",
     "type": "tarball",
-    "url": "https://github.com/mirrexagon/nixpkgs-esp-dev/archive/a9ee12a6c8235eb5a9d94934d3e79afac2103ffb.tar.gz",
-    "version": "a9ee12a6c8235eb5a9d94934d3e79afac2103ffb"
+    "url": "https://github.com/mirrexagon/nixpkgs-esp-dev/archive/5287d6e1ca9e15ebd5113c41b9590c468e1e001b.tar.gz",
+    "version": "5287d6e1ca9e15ebd5113c41b9590c468e1e001b"
   },
   "pyproject-nix": {
     "name": "pyproject-nix",
     "owner": "pyproject-nix",
     "repo": "pyproject.nix",
-    "rev": "2c8df1383b32e5443c921f61224b198a2282a657",
-    "sha256": "05mw853w8g02lnhvfb3qlcqvb0f9y29af5blvk00jq3szjsaz8n5",
+    "rev": "43f0b40edd0a74c63f66b7b48d969ae6b740d611",
+    "sha256": "0wxk4sf0s64dwc0988kadh9hpysxig0zph5d39gqzbqnwi5ga41d",
     "type": "tarball",
-    "url": "https://github.com/pyproject-nix/pyproject.nix/archive/2c8df1383b32e5443c921f61224b198a2282a657.tar.gz",
-    "version": "2c8df1383b32e5443c921f61224b198a2282a657"
+    "url": "https://github.com/pyproject-nix/pyproject.nix/archive/43f0b40edd0a74c63f66b7b48d969ae6b740d611.tar.gz",
+    "version": "43f0b40edd0a74c63f66b7b48d969ae6b740d611"
   },
   "qoi-conv": {
     "name": "qoi-conv",
@@ -60,11 +60,11 @@
     "name": "rust-overlay",
     "owner": "oxalica",
     "repo": "rust-overlay",
-    "rev": "d81285ba8199b00dc31847258cae3c655b605e8c",
-    "sha256": "0m8qxw7kbvpyfgv9camifj47q88zcf3j63agviin47xvzkv9gc2v",
+    "rev": "06ba695dfefc4afc513b49dfc41c4bf0dd2eaeb1",
+    "sha256": "10nc6insr538ci64978km945f87r0d26kvz61gyzws2capclfzk6",
     "type": "tarball",
-    "url": "https://github.com/oxalica/rust-overlay/archive/d81285ba8199b00dc31847258cae3c655b605e8c.tar.gz",
-    "version": "d81285ba8199b00dc31847258cae3c655b605e8c"
+    "url": "https://github.com/oxalica/rust-overlay/archive/06ba695dfefc4afc513b49dfc41c4bf0dd2eaeb1.tar.gz",
+    "version": "06ba695dfefc4afc513b49dfc41c4bf0dd2eaeb1"
   },
   "zephyr": {
     "name": "zephyr",
@@ -80,10 +80,10 @@
     "name": "zephyr-nix",
     "owner": "nix-community",
     "repo": "zephyr-nix",
-    "rev": "c041f535856725919b73a29d53ea2292b2a7c308",
-    "sha256": "1cpxhnb9iz8imrq1xf9bmnccmljx12cd2sclylvv02p69cl99mi8",
+    "rev": "6966fb1cbf2fdb494bea3062c5e8e7d44dd8ac9c",
+    "sha256": "0h3y6cqsckyawc9m49bfwh9xprzndqv28isdg7ln5chgac8cxfp3",
     "type": "tarball",
-    "url": "https://github.com/nix-community/zephyr-nix/archive/c041f535856725919b73a29d53ea2292b2a7c308.tar.gz",
-    "version": "c041f535856725919b73a29d53ea2292b2a7c308"
+    "url": "https://github.com/nix-community/zephyr-nix/archive/6966fb1cbf2fdb494bea3062c5e8e7d44dd8ac9c.tar.gz",
+    "version": "6966fb1cbf2fdb494bea3062c5e8e7d44dd8ac9c"
   }
 }

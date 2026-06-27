@@ -7,15 +7,16 @@ use serde_json::Value;
 use tokio::{
     sync::{Mutex, mpsc},
     task::JoinHandle,
+    time::{Duration, sleep},
 };
 use uuid::Uuid;
 
 use crate::{
-    protocol::{self, AudioFrame, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
-    services::{ServiceBundle, TtsEvent},
+    protocol::{self, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
+    services::{AsrStream, ServiceBundle, TtsEvent},
 };
 
-const MOCK_ASR_TRIGGER_FRAMES: usize = 20;
+const TEMP_LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -30,12 +31,13 @@ enum Outbound {
     Pong(Bytes),
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct SessionState {
     listening: bool,
     already_triggered: bool,
     listen_mode: Option<String>,
-    frames: Vec<AudioFrame>,
+    asr: Option<Box<dyn AsrStream>>,
+    listen_timeout: Option<JoinHandle<()>>,
     pipeline: Option<JoinHandle<()>>,
 }
 
@@ -129,7 +131,7 @@ pub async fn handle_websocket(
         }
     }
 
-    abort_pipeline(&ctx, &state, false).await;
+    abort_active(&ctx, &state, false).await;
     drop(out_tx);
     if let Err(err) = writer.await {
         tracing::debug!(session_id, %err, "websocket writer join error");
@@ -170,28 +172,49 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
         }
         "listen" => match incoming.state() {
             Some("start") => {
-                abort_pipeline(ctx, state, true).await;
-                let mut guard = state.lock().await;
-                guard.listening = true;
-                guard.already_triggered = false;
-                guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
-                guard.frames.clear();
-                tracing::info!(
-                    session_id = ctx.id,
-                    mode = ?guard.listen_mode,
-                    "listen started"
-                );
+                abort_active(ctx, state, true).await;
+                match ctx.services.asr.start_stream().await {
+                    Ok(asr) => {
+                        let timeout_ctx = ctx.clone();
+                        let timeout_state = state.clone();
+                        let listen_timeout = tokio::spawn(async move {
+                            sleep(TEMP_LISTEN_TIMEOUT).await;
+                            finish_listening(
+                                timeout_ctx,
+                                timeout_state,
+                                "temporary listen timeout",
+                                false,
+                            )
+                            .await;
+                        });
+
+                        let mut guard = state.lock().await;
+                        guard.listening = true;
+                        guard.already_triggered = false;
+                        guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
+                        guard.asr = Some(asr);
+                        if let Some(old) = guard.listen_timeout.replace(listen_timeout) {
+                            old.abort();
+                        }
+                        tracing::info!(
+                            session_id = ctx.id,
+                            mode = ?guard.listen_mode,
+                            timeout_ms = TEMP_LISTEN_TIMEOUT.as_millis(),
+                            "listen started"
+                        );
+                    }
+                    Err(err) => {
+                        let error_chain = format_error_chain(err.as_ref());
+                        tracing::warn!(
+                            session_id = ctx.id,
+                            error_chain,
+                            "failed to start asr stream"
+                        );
+                    }
+                }
             }
             Some("stop") => {
-                let should_trigger = {
-                    let mut guard = state.lock().await;
-                    guard.listening = false;
-                    !guard.already_triggered
-                };
-                tracing::info!(session_id = ctx.id, "listen stopped");
-                if should_trigger {
-                    trigger_conversation(ctx.clone(), state.clone()).await;
-                }
+                finish_listening(ctx.clone(), state.clone(), "listen stopped", true).await;
             }
             Some("detect") => {
                 let wake_word = incoming
@@ -200,7 +223,7 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 tracing::info!(session_id = ctx.id, wake_word, "wake word detected");
-                abort_pipeline(ctx, state, true).await;
+                abort_active(ctx, state, true).await;
             }
             other => tracing::debug!(session_id = ctx.id, ?other, "unknown listen state"),
         },
@@ -211,7 +234,7 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                 .and_then(|v| v.as_str())
                 .unwrap_or("manual");
             tracing::info!(session_id = ctx.id, reason, "abort requested");
-            abort_pipeline(ctx, state, true).await;
+            abort_active(ctx, state, true).await;
         }
         "mcp" => tracing::debug!(session_id = ctx.id, "mcp message ignored in v1"),
         "goodbye" => return false,
@@ -232,42 +255,73 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
         }
     };
 
-    let should_trigger = {
-        let mut guard = state.lock().await;
-        if !guard.listening {
-            tracing::trace!(session_id = ctx.id, "discarding audio while not listening");
-            return;
+    let mut guard = state.lock().await;
+    if !guard.listening {
+        tracing::trace!(session_id = ctx.id, "discarding audio while not listening");
+        return;
+    }
+
+    if let Some(asr) = guard.asr.as_mut() {
+        if let Err(err) = asr.push_audio(frame).await {
+            let error_chain = format_error_chain(err.as_ref());
+            tracing::warn!(
+                session_id = ctx.id,
+                error_chain,
+                "failed to push audio to asr stream"
+            );
         }
-
-        guard.frames.push(frame);
-        !guard.already_triggered && guard.frames.len() >= MOCK_ASR_TRIGGER_FRAMES
-    };
-
-    if should_trigger {
-        trigger_conversation(ctx.clone(), state.clone()).await;
     }
 }
 
-async fn trigger_conversation(ctx: SessionContext, state: Arc<Mutex<SessionState>>) {
-    let frames = {
+async fn finish_listening(
+    ctx: SessionContext,
+    state: Arc<Mutex<SessionState>>,
+    reason: &'static str,
+    abort_timeout: bool,
+) {
+    let (asr, timeout) = {
         let mut guard = state.lock().await;
-        if guard.already_triggered {
-            return;
-        }
-        guard.already_triggered = true;
         guard.listening = false;
-        guard.frames.clone()
+        if guard.already_triggered {
+            (None, None)
+        } else {
+            guard.already_triggered = true;
+            (
+                guard.asr.take(),
+                if abort_timeout {
+                    guard.listen_timeout.take()
+                } else {
+                    None
+                },
+            )
+        }
     };
 
-    tracing::info!(
-        session_id = ctx.id,
-        frames = frames.len(),
-        "starting mock conversation pipeline"
-    );
+    if let Some(timeout) = timeout {
+        timeout.abort();
+    }
+
+    tracing::info!(session_id = ctx.id, reason, "listen finished");
+    if let Some(asr) = asr {
+        trigger_conversation(ctx, state, asr).await;
+    }
+}
+
+async fn trigger_conversation(
+    ctx: SessionContext,
+    state: Arc<Mutex<SessionState>>,
+    asr: Box<dyn AsrStream>,
+) {
+    tracing::info!(session_id = ctx.id, "starting conversation pipeline");
     let pipeline_ctx = ctx.clone();
     let handle = tokio::spawn(async move {
-        if let Err(err) = run_pipeline(pipeline_ctx.clone(), frames).await {
-            tracing::warn!(session_id = pipeline_ctx.id, %err, "conversation pipeline failed");
+        if let Err(err) = run_pipeline(pipeline_ctx.clone(), asr).await {
+            let error_chain = format_error_chain(err.as_ref());
+            tracing::warn!(
+                session_id = pipeline_ctx.id,
+                error_chain,
+                "conversation pipeline failed"
+            );
             send_json(&pipeline_ctx, protocol::tts_stop(&pipeline_ctx.id)).await;
         }
     });
@@ -278,8 +332,8 @@ async fn trigger_conversation(ctx: SessionContext, state: Arc<Mutex<SessionState
     }
 }
 
-async fn run_pipeline(ctx: SessionContext, frames: Vec<AudioFrame>) -> anyhow::Result<()> {
-    let text = ctx.services.asr.recognize(&frames).await?;
+async fn run_pipeline(ctx: SessionContext, mut asr: Box<dyn AsrStream>) -> anyhow::Result<()> {
+    let text = asr.finish().await?;
     send_json(&ctx, protocol::stt(&ctx.id, &text)).await;
     send_json(&ctx, protocol::llm_emotion(&ctx.id, "happy", "😊")).await;
     send_json(&ctx, protocol::tts_start(&ctx.id)).await;
@@ -306,22 +360,35 @@ async fn run_pipeline(ctx: SessionContext, frames: Vec<AudioFrame>) -> anyhow::R
     Ok(())
 }
 
-async fn abort_pipeline(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, send_stop: bool) {
-    let handle = {
+async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, send_stop: bool) {
+    let (pipeline, mut asr, listen_timeout) = {
         let mut guard = state.lock().await;
-        guard.pipeline.take()
+        guard.listening = false;
+        guard.already_triggered = false;
+        (
+            guard.pipeline.take(),
+            guard.asr.take(),
+            guard.listen_timeout.take(),
+        )
     };
 
-    if let Some(handle) = handle {
-        if handle.is_finished() {
-            return;
-        }
+    if let Some(listen_timeout) = listen_timeout {
+        listen_timeout.abort();
+    }
 
-        handle.abort();
-        tracing::info!(session_id = ctx.id, "conversation pipeline aborted");
-        if send_stop {
-            send_json(ctx, protocol::tts_stop(&ctx.id)).await;
+    if let Some(handle) = pipeline {
+        if !handle.is_finished() {
+            handle.abort();
+            tracing::info!(session_id = ctx.id, "conversation pipeline aborted");
+            if send_stop {
+                send_json(ctx, protocol::tts_stop(&ctx.id)).await;
+            }
         }
+    }
+
+    if let Some(asr) = asr.as_mut() {
+        asr.abort().await;
+        tracing::info!(session_id = ctx.id, "asr stream aborted");
     }
 }
 
@@ -332,4 +399,15 @@ async fn send_json(ctx: &SessionContext, value: Value) {
             "failed to enqueue json: websocket closed"
         );
     }
+}
+
+fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut source = err.source();
+    while let Some(err) = source {
+        out.push_str(": ");
+        out.push_str(&err.to_string());
+        source = err.source();
+    }
+    out
 }

@@ -27,6 +27,7 @@ pkgs.mkShell {
     rust-tool-chain
 
     openssl
+    libopus
     pkg-config
     cargo-deny
     cargo-edit
