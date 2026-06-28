@@ -280,7 +280,7 @@ handle_websocket()
 | `XIAOZHI_PI_RPC_FLAGS` | 安全默认值（见 §3.3） | **空格分隔**，完全透传给 `pi` |
 | `XIAOZHI_PI_RPC_SYSTEM_PROMPT_FILE` | 必填（如果要用） | 文件路径；内容会拼成 `--system-prompt <text>` |
 | `XIAOZHI_PI_RPC_CWD` | 继承 | 子进程 cwd |
-| `XIAOZHI_PI_RPC_IDLE_TIMEOUT_MS` | `60000` | stdout 静默多久杀子进程 |
+| `XIAOZHI_PI_RPC_IDLE_TIMEOUT_MS` | `300000` | stdout 静默多久杀子进程 |
 | **OpenAI 兼容模式专属** | | |
 | `XIAOZHI_LLM_API_KEY` / `OPENAI_API_KEY` | 必填 | |
 | `XIAOZHI_LLM_MODEL` / `OPENAI_MODEL` | `gpt-4o-mini` | |

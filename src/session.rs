@@ -806,9 +806,19 @@ async fn run_pipeline_with_text(
             total_elapsed_ms = pipeline_started.elapsed().as_millis(),
             "asr returned empty text; skipping llm and returning to listen"
         );
-        // Send tts.stop so the client transitions out of the (never-entered)
-        // speaking state and re-enters listening. In auto mode this will
-        // trigger a fresh listen.start from the client.
+        // Send a paired `tts.start` + `tts.stop` so the client
+        // transitions through `kDeviceStateSpeaking` and back to
+        // `kDeviceStateListening`. The ESP32 firmware only acts on
+        // `tts.stop` when it is currently in `kDeviceStateSpeaking`,
+        // and the transition into `kDeviceStateListening` is what
+        // triggers it to re-send `listen.start`. Without `tts.start`
+        // first, the client stays in `kDeviceStateListening` (its
+        // state never changes), never re-sends `listen.start`, and
+        // every subsequent audio frame is dropped server-side by
+        // `discarding audio while not listening`. This is the
+        // "ASR returned empty text and nothing responds afterwards"
+        // failure mode.
+        send_json(&ctx, protocol::tts_start(&ctx.id)).await;
         send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
         maybe_schedule_close_after_chat(&ctx, &state, false).await;
         return Ok(());

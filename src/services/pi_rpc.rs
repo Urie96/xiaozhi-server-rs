@@ -63,7 +63,7 @@ impl PiRpcLlmFactoryConfig {
         }
 
         let cwd = env_str("XIAOZHI_PI_RPC_CWD").map(PathBuf::from);
-        let stream_idle_timeout_ms = env_u64("XIAOZHI_PI_RPC_IDLE_TIMEOUT_MS", 60_000);
+        let stream_idle_timeout_ms = env_u64("XIAOZHI_PI_RPC_IDLE_TIMEOUT_MS", 300_000);
 
         let config = Self {
             command: command.clone(),
