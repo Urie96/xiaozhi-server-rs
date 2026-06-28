@@ -29,6 +29,27 @@ use crate::{
 const CLIENT_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_LISTEN_MAX_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Default idle window before the server simulates a "goodbye" prompt
+/// for the user. Configurable via `XIAOZHI_IDLE_CLOSE_SECONDS`.
+const DEFAULT_IDLE_CLOSE_SECONDS: u64 = 90;
+
+/// After the TTS stream for an exit-intent round has fully drained, wait
+/// this long before closing the WebSocket so the final Opus frame has
+/// time to reach the device and finish playing. The 240 ms headroom
+/// covers one 60 ms Opus packet of network jitter plus the prebuffer
+/// pacing the TTS service already introduced.
+const POST_TTS_FLUSH_DELAY: Duration = Duration::from_millis(240);
+
+/// Default exit-command keywords. Matched as exact, trimmed equality
+/// against the final ASR text. Configurable via `XIAOZHI_EXIT_COMMANDS`
+/// (comma-separated).
+const DEFAULT_EXIT_COMMANDS: &[&str] = &["退出", "关闭"];
+
+/// Default end-of-conversation prompt fed to the LLM when the idle
+/// watchdog fires. Configurable via `XIAOZHI_END_PROMPT`.
+const DEFAULT_END_PROMPT: &str =
+    "请你以\"时间过得真快\"开头，用富有感情、依依不舍的话来结束这场对话吧！";
+
 /// Fixed-size PCM ring buffer used as a pre-roll for ASR: it keeps the most
 /// recent ~1 second of decoded PCM samples so that when VAD finally confirms
 /// speech onset, ASR receives the audio leading up to (and including) the
@@ -49,6 +70,12 @@ enum Outbound {
     Text(Value),
     Binary(Bytes),
     Pong(Bytes),
+    /// Server-initiated WebSocket close frame. The writer sends
+    /// `Message::Close(None)` to the client and stops the send loop;
+    /// this lets the device recognise that the server is hanging up
+    /// (rather than just dropping the TCP connection), so it stops
+    /// transitioning back into listening.
+    Close,
 }
 
 #[derive(Default)]
@@ -67,6 +94,16 @@ struct SessionState {
     listen_started_at: Option<Instant>,
     first_audio_logged: bool,
     input_frames: u64,
+    /// Set when the user said something that signals end-of-conversation
+    /// (matched against `XIAOZHI_EXIT_COMMANDS`) OR when the idle
+    /// watchdog fired and queued a synthetic goodbye prompt. The next
+    /// pipeline to finish its TTS stream will, after a brief flush delay,
+    /// signal `handle_websocket` to close the WebSocket.
+    close_after_chat: bool,
+    /// Last moment any user audio was observed (`handle_binary`) or the
+    /// user explicitly entered listening (`listen.start`). Used by the
+    /// idle watchdog to decide when to fire a synthetic goodbye.
+    last_voice_ts: Option<Instant>,
     /// Owns the LLM session for the lifetime of the WebSocket connection.
     ///
     /// Held behind `Arc<Mutex<...>>` so the in-flight `run_pipeline` task can
@@ -125,6 +162,10 @@ struct SessionContext {
     version: Arc<Mutex<BinaryProtocolVersion>>,
     tx: mpsc::Sender<Outbound>,
     services: ServiceBundle,
+    /// Signals `handle_websocket` to break out of its main receive loop
+    /// and tear down the connection. Used by the conversation pipeline
+    /// once an exit-intent round has finished playing its goodbye audio.
+    shutdown_tx: mpsc::Sender<()>,
 }
 
 pub async fn handle_websocket(
@@ -162,11 +203,12 @@ pub async fn handle_websocket(
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(128);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     let writer_session_id = session_id.clone();
     let writer = tokio::spawn(async move {
         while let Some(outbound) = out_rx.recv().await {
-            let message = match outbound {
+            let message = match &outbound {
                 Outbound::Text(value) => {
                     let text = value.to_string();
                     let is_error = serde_json::from_str::<Value>(&text)
@@ -189,19 +231,33 @@ pub async fn handle_websocket(
                     }
                     Message::Text(text.into())
                 }
-                Outbound::Binary(bytes) => Message::Binary(bytes),
+                Outbound::Binary(bytes) => Message::Binary(bytes.clone()),
                 Outbound::Pong(bytes) => {
                     tracing::debug!(
                         session_id = writer_session_id,
                         bytes = bytes.len(),
                         "websocket send pong"
                     );
-                    Message::Pong(bytes)
+                    Message::Pong(bytes.clone())
+                }
+                Outbound::Close => {
+                    tracing::info!(
+                        session_id = writer_session_id,
+                        "sending websocket close frame"
+                    );
+                    Message::Close(None)
                 }
             };
 
             if let Err(err) = ws_tx.send(message).await {
                 tracing::debug!(%err, "websocket writer stopped");
+                break;
+            }
+            if matches!(outbound, Outbound::Close) {
+                tracing::debug!(
+                    session_id = writer_session_id,
+                    "websocket writer exiting after close frame"
+                );
                 break;
             }
         }
@@ -212,41 +268,72 @@ pub async fn handle_websocket(
         version: Arc::new(Mutex::new(protocol_version)),
         tx: out_tx.clone(),
         services,
+        shutdown_tx: shutdown_tx.clone(),
     };
     let state = Arc::new(Mutex::new(SessionState {
         llm: llm_slot,
         abort_notify: Arc::new(Notify::new()),
+        // Seed the idle clock at session start so the watchdog doesn't
+        // fire immediately for a freshly-connected device.
+        last_voice_ts: Some(Instant::now()),
         ..SessionState::default()
     }));
 
-    while let Some(message) = ws_rx.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                tracing::debug!(session_id, %text, "websocket recv text");
-                if !handle_text(text.to_string(), &ctx, &state).await {
+    // Idle watchdog: after a quiet window with no audio and no
+    // in-flight pipeline, synthesize a goodbye prompt and let the LLM
+    // close out the session. Drop happens automatically when the main
+    // loop exits below.
+    let watchdog_ctx = ctx.clone();
+    let watchdog_state = state.clone();
+    let watchdog = tokio::spawn(async move {
+        idle_watchdog(watchdog_ctx, watchdog_state).await;
+    });
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => {
+                tracing::info!(
+                    session_id,
+                    "shutdown signal received; closing websocket"
+                );
+                break;
+            }
+            message = ws_rx.next() => {
+                let Some(message) = message else {
                     break;
+                };
+                match message {
+                    Ok(Message::Text(text)) => {
+                        tracing::debug!(session_id, %text, "websocket recv text");
+                        if !handle_text(text.to_string(), &ctx, &state).await {
+                            break;
+                        }
+                    }
+                    Ok(Message::Binary(data)) => {
+                        handle_binary(&data, &ctx, &state).await;
+                    }
+                    Ok(Message::Ping(data)) => {
+                        tracing::debug!(session_id, bytes = data.len(), "websocket recv ping");
+                        let _ = out_tx.send(Outbound::Pong(data)).await;
+                    }
+                    Ok(Message::Pong(data)) => {
+                        tracing::debug!(session_id, bytes = data.len(), "websocket recv pong");
+                    }
+                    Ok(Message::Close(frame)) => {
+                        tracing::info!(session_id, ?frame, "websocket closed by client");
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::debug!(session_id, %err, "websocket receive error");
+                        break;
+                    }
                 }
-            }
-            Ok(Message::Binary(data)) => {
-                handle_binary(&data, &ctx, &state).await;
-            }
-            Ok(Message::Ping(data)) => {
-                tracing::debug!(session_id, bytes = data.len(), "websocket recv ping");
-                let _ = out_tx.send(Outbound::Pong(data)).await;
-            }
-            Ok(Message::Pong(data)) => {
-                tracing::debug!(session_id, bytes = data.len(), "websocket recv pong");
-            }
-            Ok(Message::Close(frame)) => {
-                tracing::info!(session_id, ?frame, "websocket closed by client");
-                break;
-            }
-            Err(err) => {
-                tracing::debug!(session_id, %err, "websocket receive error");
-                break;
             }
         }
     }
+
+    watchdog.abort();
 
     abort_active(&ctx, &state, false).await;
     {
@@ -341,6 +428,7 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                 let mut guard = state.lock().await;
                 guard.listening = true;
                 guard.already_triggered = false;
+                guard.last_voice_ts = Some(Instant::now());
                 guard.listen_mode = incoming.mode().map(ToOwned::to_owned);
                 // ASR is intentionally NOT started here. It will be opened on
                 // VAD `SpeechStart` so the first ASR bytes include the pre-roll
@@ -412,6 +500,7 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
     }
 
     guard.input_frames = guard.input_frames.saturating_add(1);
+    guard.last_voice_ts = Some(Instant::now());
     if !guard.first_audio_logged {
         guard.first_audio_logged = true;
         tracing::debug!(
@@ -678,6 +767,39 @@ async fn run_pipeline(
         "asr finish returned final text"
     );
 
+    run_pipeline_with_text(ctx, state, pipeline_started, text).await
+}
+
+async fn run_pipeline_with_text(
+    ctx: SessionContext,
+    state: Arc<Mutex<SessionState>>,
+    pipeline_started: Instant,
+    text: String,
+) -> anyhow::Result<()> {
+    // Abort notifier is cloned here and again inside the loop. We hold a
+    // `Notified` future for the *outer* wait (during ASR finish) so that an
+    // abort arriving before the pipeline reaches the TTS loop is also
+    // observed.
+    let abort_notify = {
+        let guard = state.lock().await;
+        guard.abort_notify.clone()
+    };
+
+    // Exit-command detection: full, trimmed equality against the
+    // configured keywords. If matched we still feed the text to the LLM
+    // so it can craft a goodbye, and after the TTS stream finishes we
+    // close the WebSocket. This deliberately does not interfere with the
+    // abort path: `aborted=true` short-circuits the shutdown below.
+    if let Some(cmd) = check_exit_command(&text) {
+        state.lock().await.close_after_chat = true;
+        tracing::info!(
+            session_id = ctx.id,
+            matched = cmd,
+            text = %text,
+            "exit command matched; will close after tts finishes"
+        );
+    }
+
     if text.trim().is_empty() {
         tracing::info!(
             session_id = ctx.id,
@@ -688,6 +810,7 @@ async fn run_pipeline(
         // speaking state and re-enters listening. In auto mode this will
         // trigger a fresh listen.start from the client.
         send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
+        maybe_schedule_close_after_chat(&ctx, &state, false).await;
         return Ok(());
     }
 
@@ -848,7 +971,53 @@ async fn run_pipeline(
         total_elapsed_ms = pipeline_started.elapsed().as_millis(),
         "pipeline finished"
     );
+    maybe_schedule_close_after_chat(&ctx, &state, aborted).await;
     Ok(())
+}
+
+/// If `close_after_chat` is set on the session state and the pipeline
+/// wasn't aborted, wait briefly for the final TTS audio to flush out to
+/// the device, then send a WebSocket close frame and signal the main
+/// loop to exit.
+///
+/// Sending an explicit close frame (rather than just dropping the TCP
+/// connection) is what tells the ESP32 firmware that the server is
+/// hanging up. Without it the device would treat the disconnect as an
+/// error and resume its listening loop, which is the
+/// "说关闭之后又进入监听状态了" failure mode the user reported.
+async fn maybe_schedule_close_after_chat(
+    ctx: &SessionContext,
+    state: &Arc<Mutex<SessionState>>,
+    aborted: bool,
+) {
+    if aborted {
+        return;
+    }
+    let should_close = state.lock().await.close_after_chat;
+    if !should_close {
+        return;
+    }
+    tracing::info!(
+        session_id = ctx.id,
+        "close_after_chat set; flushing final audio before closing websocket"
+    );
+    // Give the final TTS frame time to reach the device and play out.
+    sleep(POST_TTS_FLUSH_DELAY).await;
+    // Send an explicit WebSocket close frame so the device knows this
+    // is a graceful hang-up, not a network error. After this the
+    // writer task exits and the device transitions out of listening.
+    if ctx.tx.send(Outbound::Close).await.is_err() {
+        tracing::debug!(
+            session_id = ctx.id,
+            "outbound queue closed; main loop already gone"
+        );
+    }
+    if ctx.shutdown_tx.send(()).await.is_err() {
+        tracing::debug!(
+            session_id = ctx.id,
+            "shutdown_tx closed; main loop already gone"
+        );
+    }
 }
 
 // (helper removed: we now `tokio::pin!` the next-event future inline in
@@ -981,6 +1150,164 @@ fn listen_max_timeout() -> Duration {
         .unwrap_or(DEFAULT_LISTEN_MAX_TIMEOUT)
 }
 
+fn idle_close_after() -> Duration {
+    std::env::var("XIAOZHI_IDLE_CLOSE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(DEFAULT_IDLE_CLOSE_SECONDS))
+}
+
+fn exit_commands() -> Vec<String> {
+    std::env::var("XIAOZHI_EXIT_COMMANDS")
+        .ok()
+        .map(|value| {
+            // Split on commas and the CJK enumeration comma (、) only.
+            // Whitespace is NOT a separator, so phrases like "see you"
+            // survive as one entry. We still trim each entry so authors
+            // can use `, ` or `,，` comfortably.
+            value
+                .split([',', '\u{3001}'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .filter(|cmds: &Vec<String>| !cmds.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_EXIT_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
+}
+
+fn end_prompt_text() -> String {
+    std::env::var("XIAOZHI_END_PROMPT")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_END_PROMPT.to_string())
+}
+
+fn end_prompt_enabled() -> bool {
+    !matches!(
+        std::env::var("XIAOZHI_END_PROMPT_ENABLED")
+            .ok()
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no") | Some("disabled")
+    )
+}
+
+/// Returns the matched command keyword if `text` is exactly (after
+/// trimming whitespace and removing common trailing punctuation) one of
+/// the configured exit commands. Comparison is case-sensitive on the
+/// trimmed core but tolerant of trailing `。`, `！`, `?`, `？`, `!`,
+/// `~`, `…` and similar, in both ASCII and CJK fullwidth forms.
+fn check_exit_command(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let stripped = trimmed
+        .trim_end_matches(|c: char| {
+            // CJK fullwidth punctuation first (more common in Chinese
+            // ASR output) then ASCII fallbacks. Whitespace is included
+            // so a stray trailing space doesn't block the match.
+            matches!(c, '。' | '！' | '？' | '!' | '?' | '~' | '…' | ' ' | '\t')
+        })
+        .trim_end();
+    exit_commands()
+        .into_iter()
+        .find(|cmd| stripped == cmd.as_str() || trimmed == cmd.as_str())
+}
+
+/// Watchdog that fires when the device has been idle for longer than the
+/// configured threshold with no audio and no in-flight pipeline. When it
+/// fires it seeds `close_after_chat=true` and feeds the end-prompt as a
+/// synthetic user turn into the pipeline, so the LLM produces a goodbye
+/// and the normal exit path closes the WebSocket. Drop is the cancel
+/// mechanism: when `handle_websocket` returns it aborts the spawned
+/// task.
+async fn idle_watchdog(ctx: SessionContext, state: Arc<Mutex<SessionState>>) {
+    if !end_prompt_enabled() {
+        tracing::info!(
+            session_id = ctx.id,
+            "end prompt disabled; idle watchdog will not fire"
+        );
+        return;
+    }
+    let threshold = idle_close_after();
+    let interval = Duration::from_secs(5);
+    let prompt = end_prompt_text();
+    tracing::info!(
+        session_id = ctx.id,
+        threshold_seconds = threshold.as_secs(),
+        "idle watchdog armed"
+    );
+
+    loop {
+        sleep(interval).await;
+
+        // Atomically check the precondition and, if it holds, claim the
+        // slot. We set `close_after_chat=true` up front so a second
+        // observer (e.g. a concurrent listen.start) sees the session is
+        // already winding down.
+        let prompt = prompt.clone();
+        let should_fire = {
+            let mut guard = state.lock().await;
+            let idle = guard
+                .last_voice_ts
+                .map(|ts| ts.elapsed() >= threshold)
+                .unwrap_or(false);
+            let busy = guard.listening || guard.pipeline.is_some();
+            if !guard.close_after_chat && !busy && idle {
+                guard.close_after_chat = true;
+                guard.last_voice_ts = Some(Instant::now());
+                true
+            } else {
+                false
+            }
+        };
+        if !should_fire {
+            continue;
+        }
+
+        tracing::info!(
+            session_id = ctx.id,
+            threshold_seconds = threshold.as_secs(),
+            "idle timeout reached; feeding synthetic end-prompt to llm"
+        );
+
+        let ctx_for_pipeline = ctx.clone();
+        let state_for_pipeline = state.clone();
+        let handle = tokio::spawn(async move {
+            let pipeline_started = Instant::now();
+            if let Err(err) = run_pipeline_with_text(
+                ctx_for_pipeline.clone(),
+                state_for_pipeline.clone(),
+                pipeline_started,
+                prompt,
+            )
+            .await
+            {
+                tracing::error!(
+                    session_id = ctx_for_pipeline.id,
+                    error = %format_error_chain(err.as_ref()),
+                    "idle-triggered pipeline failed"
+                );
+                // Best-effort: still try to close so the device doesn't
+                // hang on a wedged session.
+                let _ = ctx_for_pipeline.shutdown_tx.send(()).await;
+            }
+        });
+        state.lock().await.pipeline = Some(handle);
+    }
+}
+
 fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut out = err.to_string();
     let mut source = err.source();
@@ -990,4 +1317,157 @@ fn format_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
         source = err.source();
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// `check_exit_command` / `idle_close_after` / `end_prompt_enabled`
+    /// all read env at call time. Cargo runs tests in parallel, but env
+    /// is process-global state — so any test that touches an env var
+    /// must hold this mutex for its entire body. The 2024 edition also
+    /// marks `set_var` / `remove_var` as `unsafe` because of the data
+    /// race; holding the lock is the synchronisation that makes the
+    /// unsafe call sound.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// `check_exit_command` reads `XIAOZHI_EXIT_COMMANDS` at call time,
+    /// so tests must set/clear the env var explicitly. We isolate each
+    /// case with a tiny RAII guard.
+    struct ExitCommandsGuard {
+        prev: Option<String>,
+    }
+
+    impl ExitCommandsGuard {
+        fn new(value: Option<&str>) -> Self {
+            let prev = std::env::var("XIAOZHI_EXIT_COMMANDS").ok();
+            // SAFETY: the test holds ENV_LOCK for the duration of the
+            // guard, so no other thread reads this env var concurrently.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("XIAOZHI_EXIT_COMMANDS", v),
+                    None => std::env::remove_var("XIAOZHI_EXIT_COMMANDS"),
+                }
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for ExitCommandsGuard {
+        fn drop(&mut self) {
+            // SAFETY: see ExitCommandsGuard::new.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("XIAOZHI_EXIT_COMMANDS", v),
+                    None => std::env::remove_var("XIAOZHI_EXIT_COMMANDS"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exit_command_matches_default_keywords_exactly() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ExitCommandsGuard::new(None);
+        let r = check_exit_command("退出");
+        let d = r.as_deref();
+        assert_eq!(d, Some("退出"));
+        let r = check_exit_command("关闭");
+        let d = r.as_deref();
+        assert_eq!(d, Some("关闭"));
+    }
+
+    #[test]
+    fn exit_command_tolerates_trailing_punctuation() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ExitCommandsGuard::new(None);
+        let r = check_exit_command("退出。");
+        let d = r.as_deref();
+        assert_eq!(d, Some("退出"));
+        let r = check_exit_command("退出!");
+        let d = r.as_deref();
+        assert_eq!(d, Some("退出"));
+        let r = check_exit_command("退出？");
+        let d = r.as_deref();
+        assert_eq!(d, Some("退出"));
+        let r = check_exit_command("关闭…");
+        let d = r.as_deref();
+        assert_eq!(d, Some("关闭"));
+    }
+
+    #[test]
+    fn exit_command_does_not_match_substring_or_sentence() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ExitCommandsGuard::new(None);
+        // "退出系统" is a phrase, not the bare keyword.
+        assert!(check_exit_command("退出系统").is_none());
+        assert!(check_exit_command("我想退出").is_none());
+        assert!(check_exit_command("请关闭一下吧").is_none());
+        assert!(check_exit_command("").is_none());
+        assert!(check_exit_command("   ").is_none());
+    }
+
+    #[test]
+    fn exit_command_respects_custom_env_var() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ExitCommandsGuard::new(Some("bye,see you,晚安"));
+        let r = check_exit_command("bye");
+        let d = r.as_deref();
+        assert_eq!(d, Some("bye"));
+        let r = check_exit_command("see you");
+        let d = r.as_deref();
+        assert_eq!(d, Some("see you"));
+        let r = check_exit_command("晚安");
+        let d = r.as_deref();
+        assert_eq!(d, Some("晚安"));
+        // Defaults no longer apply once env is set.
+        assert!(check_exit_command("退出").is_none());
+    }
+
+    #[test]
+    fn idle_close_after_reads_env_or_default() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XIAOZHI_IDLE_CLOSE_SECONDS").ok();
+        // SAFETY: ENV_LOCK is held; no concurrent env readers.
+        unsafe {
+            std::env::remove_var("XIAOZHI_IDLE_CLOSE_SECONDS");
+            assert_eq!(idle_close_after(), Duration::from_secs(90));
+            std::env::set_var("XIAOZHI_IDLE_CLOSE_SECONDS", "45");
+            assert_eq!(idle_close_after(), Duration::from_secs(45));
+            std::env::set_var("XIAOZHI_IDLE_CLOSE_SECONDS", "0");
+            // 0 is treated as "use default" (not a valid threshold).
+            assert_eq!(idle_close_after(), Duration::from_secs(90));
+            std::env::set_var("XIAOZHI_IDLE_CLOSE_SECONDS", "bogus");
+            assert_eq!(idle_close_after(), Duration::from_secs(90));
+            match prev {
+                Some(v) => std::env::set_var("XIAOZHI_IDLE_CLOSE_SECONDS", v),
+                None => std::env::remove_var("XIAOZHI_IDLE_CLOSE_SECONDS"),
+            }
+        }
+    }
+
+    #[test]
+    fn end_prompt_disabled_short_circuits_watchdog() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("XIAOZHI_END_PROMPT_ENABLED").ok();
+        // SAFETY: ENV_LOCK is held; no concurrent env readers.
+        unsafe {
+            std::env::set_var("XIAOZHI_END_PROMPT_ENABLED", "false");
+            assert!(!end_prompt_enabled());
+            std::env::set_var("XIAOZHI_END_PROMPT_ENABLED", "0");
+            assert!(!end_prompt_enabled());
+            std::env::set_var("XIAOZHI_END_PROMPT_ENABLED", "off");
+            assert!(!end_prompt_enabled());
+            std::env::remove_var("XIAOZHI_END_PROMPT_ENABLED");
+            assert!(end_prompt_enabled());
+            std::env::set_var("XIAOZHI_END_PROMPT_ENABLED", "true");
+            assert!(end_prompt_enabled());
+            match prev {
+                Some(v) => std::env::set_var("XIAOZHI_END_PROMPT_ENABLED", v),
+                None => std::env::remove_var("XIAOZHI_END_PROMPT_ENABLED"),
+            }
+        }
+    }
 }
