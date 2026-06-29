@@ -50,7 +50,7 @@ xiaozhi-server-rs/
         ├── mod.rs            # ServiceBundle 组装 + trait 定义
         ├── mock.rs           # MockAsr / MockLlmFactory / MockTts
         ├── openai.rs         # OpenAI 兼容 Chat Completions 流式 LLM
-        ├── pi_rpc.rs         # 通过 `pi --mode rpc` 子进程调 LLM
+        ├── pi_http.rs        # 通过 pi-server HTTP/SSE 调 LLM
         ├── volcengine_asr.rs # 火山引擎流式 ASR（wss + 二进制协议）
         └── volcengine.rs     # 火山引擎双向 TTS（wss + ogg_opus demux）
 ```
@@ -118,16 +118,23 @@ ASR 接收的是 **PCM i16（16 kHz mono）**，不是原始 Opus。`session.rs`
 
 这样做的好处：ASR 第一帧就包含 VAD 触发前的那一段音频，不会丢首字。
 
-### 3.3 `pi_rpc.rs` 子进程模型
+### 3.3 `pi_http.rs` / pi-server HTTP 模型
 
-每个 WebSocket 连接 spawn 一个 `pi --mode rpc` 子进程。生命周期：
+Rust 服务不再 spawn `pi --mode rpc` 子进程，而是调用外部 pi-server：`/home/urie/workspace/js/pi-server`。pi-server 由用户单独启动，Rust 只负责 HTTP/SSE 客户端。
+
+默认配置：
+- `XIAOZHI_LLM_PROVIDER=pi` → 启用 pi-server provider
+- `XIAOZHI_PI_HTTP_BASE_URL` 默认 `http://127.0.0.1:8081`
+- `XIAOZHI_PI_AGENT_ID` 默认 `zhuzhu`
+
+调用生命周期：
 
 ```
 handle_websocket()
-   ├─ services.llm.create_session()        # spawn 子进程
-   ├─ pipeline: llm.chat_stream(prompt)    # 发 prompt
-   ├─ abort_active → llm.abort()           # 发 {"type":"abort"}
-   └─ ws close → llm.shutdown()            # 发 {"type":"abort"} + kill 子进程
+   ├─ services.llm.create_session()        # 创建 HTTP provider session
+   ├─ pipeline: llm.chat_stream(prompt)    # POST /chat + 读取 SSE
+   ├─ abort_active → llm.abort()           # 中断 HTTP 响应体/reader task
+   └─ ws close → llm.shutdown()            # 中断仍在进行的 HTTP 请求
 ```
 
 #### LLM Session 契约（**最重要**，违反会导致 abort 不工作）
@@ -136,21 +143,12 @@ handle_websocket()
 >
 > 这不是性能优化，是 abort 协议要求。如果在锁内 await，`abort_active` 拿不到锁就调不了 `llm.abort()`。
 
-`pi_rpc.rs` 已经踩过这个坑的实现要点：
-- `mpsc::Sender<WriterCommand>` 串行化所有对子进程 stdin 的写入
-- `tokio::sync::broadcast::Sender<PiEvent>` 多消费者（reader_loop → coordinator_loop / chat_stream 各 subscribe 一份）
-- `reader_loop` 区分 `assistantMessageEvent.type`：`text_delta` 进 `TextDelta`，`thinking_*` 丢弃
-- `coordinator_loop` 监听 `ChildExited` / `Idle` / `shutdown_rx`，杀掉子进程
-- `chat_stream` 60s idle 才报错（不是双重 continue 延长）
-
-#### 默认 flag
-当 `XIAOZHI_PI_RPC_FLAGS` 未设置时，注入安全默认值（关闭工具、技能、提示词模板、扩展、session、thinking）：
-```
---no-tools --no-builtin-tools --no-skills --no-prompt-templates
---no-context-files --no-themes --no-extensions --no-session --thinking off
-```
-
-如果用户传入自己的 `XIAOZHI_PI_RPC_FLAGS`（空格分隔），**完全透传**，不做白名单校验。
+`pi_http.rs` 实现要点：
+- 请求 `POST {base_url}/chat`，body 为 `{ "prompt": "..." }`
+- agent id 通过 `Authorization: Bearer <agent_id>` 发送，当前默认固定 `zhuzhu`
+- 解析 SSE：`text_delta.data.delta` 进入 `TextStream`，`thinking_*` 忽略，`agent_end` 结束，`error` 转错误
+- abort/shutdown 通过 `JoinHandle::abort()` 停掉 HTTP reader task，drop 掉响应体；pi-server 会在客户端断开时 abort 当前 generation
+- 固定 `zhuzhu` 意味着所有连接共享 `sessions/zhuzhu.jsonl` 历史，并且同一时刻的新 `/chat` 会抢占旧 `/chat`
 
 ---
 
@@ -274,13 +272,11 @@ handle_websocket()
 ### LLM
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `XIAOZHI_LLM_PROVIDER` | `mock` | `mock` / `openai` / `pi` / `pi-rpc` |
-| **pi 模式专属** | | |
-| `XIAOZHI_PI_RPC_COMMAND` | `pi` | 可执行文件名 |
-| `XIAOZHI_PI_RPC_FLAGS` | 安全默认值（见 §3.3） | **空格分隔**，完全透传给 `pi` |
-| `XIAOZHI_PI_RPC_SYSTEM_PROMPT_FILE` | 必填（如果要用） | 文件路径；内容会拼成 `--system-prompt <text>` |
-| `XIAOZHI_PI_RPC_CWD` | 继承 | 子进程 cwd |
-| `XIAOZHI_PI_RPC_IDLE_TIMEOUT_MS` | `300000` | stdout 静默多久杀子进程 |
+| `XIAOZHI_LLM_PROVIDER` | `mock` | `mock` / `openai` / `pi` / `pi-http` |
+| **pi-server 模式专属** | | |
+| `XIAOZHI_PI_HTTP_BASE_URL` / `PI_SERVER_BASE_URL` | `http://127.0.0.1:8081` | pi-server 地址 |
+| `XIAOZHI_PI_AGENT_ID` / `PI_SERVER_AGENT_ID` | `zhuzhu` | pi-server agent id；通过 Bearer token 发送 |
+| `XIAOZHI_PI_HTTP_IDLE_TIMEOUT_MS` / `PI_SERVER_IDLE_TIMEOUT_MS` | `300000` | SSE 静默多久视为错误 |
 | **OpenAI 兼容模式专属** | | |
 | `XIAOZHI_LLM_API_KEY` / `OPENAI_API_KEY` | 必填 | |
 | `XIAOZHI_LLM_MODEL` / `OPENAI_MODEL` | `gpt-4o-mini` | |
@@ -346,9 +342,9 @@ direnv exec . cargo run
 - 确认 `XIAOZHI_PUBLIC_WS_URL` 用的是**电脑局域网 IP**（如 `ws://192.168.2.1:8080/ws`），不能用 `127.0.0.1`。
 - ESP32 端 NVS 写入 token 后会带到 `Authorization` header；没配置时本服务**目前放行**。
 - 跑起来后看 `RUST_LOG=xiaozhi_server_rs=debug,tower_http=info`，关键日志：
-  - `using volcengine tts / asr / pi rpc llm / Silero VAD` — provider 选择
+  - `using volcengine tts / asr / pi-server HTTP streaming llm / Silero VAD` — provider 选择
   - `websocket session connected` — 客户端连上
-  - `using pi rpc llm command=... rendered_args=...` — pi 命令行（看 flag 透传是否对）
+  - `using pi-server HTTP streaming llm base_url=... agent_id=...` — pi-server 接入配置
   - `client hello received version=V2/V3/V1` — 二进制协议版本
   - `listen started vad_enabled=true` — VAD 启用
   - `VAD speech started; opening ASR` — VAD 触发
@@ -416,7 +412,7 @@ RUST_LOG=xiaozhi_server_rs::services::volcengine=trace cargo run
 - **没有端到端测试**：目前只靠手动联调。
 - **没有 rate limit / 单设备并发控制**。
 - **`/`ota` 是固定响应**：不分设备、不查 NVS、不真升级。
-- **pi-rpc 历史**：当前每个 prompt 走独立 request，没在 `chat_stream` 之间复用 conversation 上下文（这是 §3.2 简化决定的）。
+- **pi-server 历史共享**：当前默认固定 `agent_id=zhuzhu`，所有 WebSocket 连接共享 `sessions/zhuzhu.jsonl`，同一 agent 的新 `/chat` 会抢占旧 `/chat`。
 - **OpenAI LLM 没有 abort 协议支持**：abort 路径只是 `let _ = self.llm.abort()`，OpenAI provider 实际没有 abort 流；要真打断得换 provider 或改成 SSE-aware。
 
 ### 11.1 退出 / 退场逻辑（按 Python `xiaozhi-esp32-server` 的简化版）

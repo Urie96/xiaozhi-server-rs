@@ -110,16 +110,15 @@ struct SessionState {
     /// borrow it (calling `chat_stream` synchronously under the lock) without
     /// moving it out of `SessionState`. This is critical: if the pipeline
     /// task is later notified to abort, it must NOT be holding the only
-    /// reference to the LLM, because for `pi-rpc` the LLM is a live child
-    /// process and dropping it would kill the process (and lose the
-    /// session). The lock is held only for the synchronous `chat_stream`
-    /// call; the lock is never held across an `await`.
+    /// reference to the LLM, because abort/shutdown must stay routed through
+    /// the provider implementation. The lock is held only for the synchronous
+    /// `chat_stream` call; the lock is never held across an `await`.
     llm: Arc<Mutex<Option<Box<dyn LlmSession>>>>,
     /// Notified by `abort_active` so the running `run_pipeline` task can
     /// observe the abort, emit a `tts.stop`, and exit cleanly. The pipeline
     /// task is never cancelled with `JoinHandle::abort`, because that
-    /// would drop its stack-locals (including any LLM handle) and kill the
-    /// underlying pi child process.
+    /// would drop its stack-locals before the provider can cleanly abort
+    /// its active request.
     abort_notify: Arc<Notify>,
 }
 
@@ -715,7 +714,7 @@ async fn trigger_conversation(
         // `listen.start` while a previous `listen.stop` is still in
         // flight). Even in that case the LLM now lives in
         // `state.llm` (not on the pipeline stack), so cancelling the
-        // task no longer kills the pi child process.
+        // task no longer drops the provider-owned session handle.
         if !old.is_finished() {
             tracing::debug!(
                 session_id = ctx.id,
@@ -837,9 +836,9 @@ async fn run_pipeline_with_text(
     // Borrow the LLM session under the lock for the synchronous
     // `chat_stream` call only. The lock is dropped as soon as we have the
     // `TextStream` in hand; we never hold the lock across an `await`. This
-    // is what guarantees `abort_active` can always reach the LLM to send an
-    // `abort` command and that the LLM (and its pi child process) is never
-    // dropped because the pipeline task was cancelled.
+    // is what guarantees `abort_active` can always reach the LLM to abort
+    // the active provider request, and that the LLM session is never dropped
+    // because the pipeline task was cancelled.
     let llm_slot = state.lock().await.llm.clone();
     let raw_llm_stream = {
         let mut guard = llm_slot.lock().await;
@@ -890,7 +889,7 @@ async fn run_pipeline_with_text(
     // TTS event loop with abort awareness. We `select!` on the next TTS
     // event vs. the abort notifier so an abort mid-pipeline is observed
     // promptly without cancelling the task (and thus without dropping the
-    // LLM handle or killing the pi child process).
+    // provider-owned LLM session handle).
     loop {
         let next_event = tts_stream.next();
         tokio::pin!(next_event);
@@ -1091,10 +1090,9 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
     // lifetime of the WebSocket connection, and we only borrow it to send
     // an abort command. This is the fix for the `llm session not
     // available` bug: previously the pipeline task would take the LLM out
-    // of state, and aborting the pipeline task would drop it (killing the
-    // pi child process via `kill_on_drop`). Now the LLM stays put, the
-    // pipeline task is notified (not cancelled) to exit cleanly, and the
-    // pi session survives across aborts.
+    // of state, and aborting the pipeline task would drop it before the
+    // provider saw an abort. Now the LLM stays put and the pipeline task is
+    // notified (not cancelled) to exit cleanly.
     let (abort_notify, mut asr) = {
         let mut guard = state.lock().await;
         guard.listening = false;
@@ -1119,9 +1117,8 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
     // emit `tts.stop` on its way out (see `run_pipeline`).
     abort_notify.notify_waiters();
 
-    // Send abort to the LLM. This is the path that actually interrupts the
-    // current prompt in pi (via `{"type":"abort"}` on stdin) while
-    // keeping the pi child process and session alive.
+    // Send abort to the LLM. For pi-server this drops the in-flight HTTP
+    // response body, which causes the server to abort the active generation.
     {
         let llm_slot = state.lock().await.llm.clone();
         let mut llm_guard = llm_slot.lock().await;

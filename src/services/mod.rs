@@ -1,6 +1,6 @@
 pub mod mock;
 pub mod openai;
-pub mod pi_rpc;
+pub mod pi_http;
 pub mod volcengine;
 pub mod volcengine_asr;
 
@@ -18,7 +18,7 @@ use crate::{
 use self::{
     mock::{MockAsr, MockLlmFactory, MockTts},
     openai::{OpenAiLlmConfig, OpenAiLlmFactory},
-    pi_rpc::{PiRpcLlmFactory, PiRpcLlmFactoryConfig},
+    pi_http::{PiHttpLlmConfig, PiHttpLlmFactory},
     volcengine::{VolcengineTts, VolcengineTtsConfig},
     volcengine_asr::{VolcengineAsr, VolcengineAsrConfig},
 };
@@ -143,42 +143,27 @@ impl ServiceBundle {
             }
         };
 
-        let llm: Arc<dyn LlmSessionFactory> =
-            if let Some(config) = PiRpcLlmFactoryConfig::from_env()? {
-                let rendered = std::iter::once(config.command.clone())
-                    .chain(config.args.iter().cloned())
-                    .map(|arg| {
-                        if arg.chars().all(|c| {
-                            c.is_ascii_alphanumeric()
-                                || matches!(c, '_' | '-' | '.' | '/' | '=' | ':' | ',')
-                        }) {
-                            arg
-                        } else {
-                            format!("'{}'", arg.replace('\'', "'\\''"))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                tracing::info!(
-                    command = %config.command,
-                    cwd = ?config.cwd,
-                    rendered_args = %rendered,
-                    "using pi rpc llm"
-                );
-                Arc::new(PiRpcLlmFactory::new(config))
-            } else if let Some(config) = OpenAiLlmConfig::from_env()? {
-                tracing::info!(
-                    base_url = %config.base_url,
-                    model = %config.model,
-                    disable_thinking = config.disable_thinking,
-                    thinking_style = ?config.thinking_style,
-                    "using OpenAI-compatible streaming llm"
-                );
-                Arc::new(OpenAiLlmFactory::new(config))
-            } else {
-                tracing::info!("using mock llm");
-                Arc::new(MockLlmFactory)
-            };
+        let llm: Arc<dyn LlmSessionFactory> = if let Some(config) = PiHttpLlmConfig::from_env()? {
+            tracing::info!(
+                base_url = %config.base_url,
+                agent_id = %config.agent_id,
+                idle_timeout_ms = config.stream_idle_timeout.as_millis(),
+                "using pi-server HTTP streaming llm"
+            );
+            Arc::new(PiHttpLlmFactory::new(config))
+        } else if let Some(config) = OpenAiLlmConfig::from_env()? {
+            tracing::info!(
+                base_url = %config.base_url,
+                model = %config.model,
+                disable_thinking = config.disable_thinking,
+                thinking_style = ?config.thinking_style,
+                "using OpenAI-compatible streaming llm"
+            );
+            Arc::new(OpenAiLlmFactory::new(config))
+        } else {
+            tracing::info!("using mock llm");
+            Arc::new(MockLlmFactory)
+        };
 
         Ok(Self { asr, llm, tts, vad })
     }
