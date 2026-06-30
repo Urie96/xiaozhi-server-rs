@@ -10,9 +10,9 @@ use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, Notify, mpsc},
+    sync::{Mutex, Notify, mpsc, oneshot},
     task::JoinHandle,
-    time::{Duration, sleep},
+    time::{Duration, sleep, timeout},
 };
 use uuid::Uuid;
 
@@ -39,6 +39,10 @@ const DEFAULT_IDLE_CLOSE_SECONDS: u64 = 90;
 /// covers one 60 ms Opus packet of network jitter plus the prebuffer
 /// pacing the TTS service already introduced.
 const POST_TTS_FLUSH_DELAY: Duration = Duration::from_millis(240);
+
+/// How long the server waits for a Pong response after sending a
+/// WebSocket Ping during idle-timeout probing.
+const WEBSOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default exit-command keywords. Matched as exact, trimmed equality
 /// against the final ASR text. Configurable via `XIAOZHI_EXIT_COMMANDS`
@@ -69,6 +73,7 @@ pub struct SessionMeta {
 enum Outbound {
     Text(Value),
     Binary(Bytes),
+    Ping(Bytes),
     Pong(Bytes),
     /// Server-initiated WebSocket close frame. The writer sends
     /// `Message::Close(None)` to the client and stops the send loop;
@@ -94,6 +99,10 @@ struct SessionState {
     listen_started_at: Option<Instant>,
     first_audio_logged: bool,
     input_frames: u64,
+    /// Active WebSocket probe waiting for a matching Pong. Used by the
+    /// idle watchdog to distinguish a live client from a dead one before
+    /// it decides whether to synthesize a goodbye prompt.
+    ws_probe: Option<WebSocketProbe>,
     /// Set when the user said something that signals end-of-conversation
     /// (matched against `XIAOZHI_EXIT_COMMANDS`) OR when the idle
     /// watchdog fired and queued a synthetic goodbye prompt. The next
@@ -167,6 +176,11 @@ struct SessionContext {
     shutdown_tx: mpsc::Sender<()>,
 }
 
+struct WebSocketProbe {
+    payload: Bytes,
+    done_tx: oneshot::Sender<()>,
+}
+
 pub async fn handle_websocket(
     socket: WebSocket,
     protocol_version: BinaryProtocolVersion,
@@ -231,6 +245,14 @@ pub async fn handle_websocket(
                     Message::Text(text.into())
                 }
                 Outbound::Binary(bytes) => Message::Binary(bytes.clone()),
+                Outbound::Ping(bytes) => {
+                    tracing::debug!(
+                        session_id = writer_session_id,
+                        bytes = bytes.len(),
+                        "websocket send ping"
+                    );
+                    Message::Ping(bytes.clone())
+                }
                 Outbound::Pong(bytes) => {
                     tracing::debug!(
                         session_id = writer_session_id,
@@ -317,7 +339,15 @@ pub async fn handle_websocket(
                         let _ = out_tx.send(Outbound::Pong(data)).await;
                     }
                     Ok(Message::Pong(data)) => {
-                        tracing::debug!(session_id, bytes = data.len(), "websocket recv pong");
+                        if complete_ws_probe(&state, &data).await {
+                            tracing::debug!(
+                                session_id,
+                                bytes = data.len(),
+                                "websocket recv pong matched probe"
+                            );
+                        } else {
+                            tracing::debug!(session_id, bytes = data.len(), "websocket recv pong");
+                        }
                     }
                     Ok(Message::Close(frame)) => {
                         tracing::info!(session_id, ?frame, "websocket closed by client");
@@ -1149,6 +1179,71 @@ async fn send_json(ctx: &SessionContext, value: Value) {
     }
 }
 
+async fn probe_websocket_alive(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>) -> bool {
+    let payload = Uuid::new_v4().as_bytes().to_vec();
+    let (done_tx, done_rx) = oneshot::channel();
+
+    {
+        let mut guard = state.lock().await;
+        if guard.ws_probe.is_some() {
+            tracing::debug!(session_id = ctx.id, "websocket probe already in flight");
+            return true;
+        }
+        guard.ws_probe = Some(WebSocketProbe {
+            payload: Bytes::from(payload.clone()),
+            done_tx,
+        });
+    }
+
+    if ctx
+        .tx
+        .send(Outbound::Ping(Bytes::from(payload.clone())))
+        .await
+        .is_err()
+    {
+        tracing::debug!(session_id = ctx.id, "failed to enqueue websocket ping");
+        let mut guard = state.lock().await;
+        guard.ws_probe = None;
+        return false;
+    }
+
+    match timeout(WEBSOCKET_PROBE_TIMEOUT, done_rx).await {
+        Ok(Ok(())) => {
+            tracing::debug!(session_id = ctx.id, "websocket probe succeeded");
+            true
+        }
+        Ok(Err(_)) => {
+            tracing::debug!(session_id = ctx.id, "websocket probe channel closed");
+            let mut guard = state.lock().await;
+            guard.ws_probe = None;
+            false
+        }
+        Err(_) => {
+            tracing::debug!(session_id = ctx.id, "websocket probe timed out");
+            let mut guard = state.lock().await;
+            guard.ws_probe = None;
+            false
+        }
+    }
+}
+
+async fn complete_ws_probe(state: &Arc<Mutex<SessionState>>, pong: &Bytes) -> bool {
+    let probe = {
+        let mut guard = state.lock().await;
+        let Some(probe) = guard.ws_probe.take() else {
+            return false;
+        };
+        if probe.payload != *pong {
+            guard.ws_probe = Some(probe);
+            return false;
+        }
+        probe
+    };
+
+    let _ = probe.done_tx.send(());
+    true
+}
+
 fn listen_max_timeout() -> Duration {
     std::env::var("XIAOZHI_LISTEN_MAX_TIMEOUT_MS")
         .ok()
@@ -1259,11 +1354,35 @@ async fn idle_watchdog(ctx: SessionContext, state: Arc<Mutex<SessionState>>) {
     loop {
         sleep(interval).await;
 
-        // Atomically check the precondition and, if it holds, claim the
-        // slot. We set `close_after_chat=true` up front so a second
-        // observer (e.g. a concurrent listen.start) sees the session is
-        // already winding down.
-        let prompt = prompt.clone();
+        // First verify the session is idle, then ping the client before
+        // we spend tokens on a synthetic goodbye. If the probe fails we
+        // close the session quietly instead of speaking to a dead socket.
+        let idle = {
+            let guard = state.lock().await;
+            let idle = guard
+                .last_voice_ts
+                .map(|ts| ts.elapsed() >= threshold)
+                .unwrap_or(false);
+            let busy = guard.listening || guard.pipeline.is_some();
+            !guard.close_after_chat && !busy && idle
+        };
+        if !idle {
+            continue;
+        }
+
+        if !probe_websocket_alive(&ctx, &state).await {
+            tracing::info!(
+                session_id = ctx.id,
+                threshold_seconds = threshold.as_secs(),
+                "idle timeout reached but websocket probe failed; closing session without goodbye"
+            );
+            let _ = ctx.shutdown_tx.send(()).await;
+            return;
+        }
+
+        // Re-check after the probe: a user may have resumed speaking
+        // while the ping was in flight, and we should not claim the
+        // session in that case.
         let should_fire = {
             let mut guard = state.lock().await;
             let idle = guard
@@ -1289,6 +1408,7 @@ async fn idle_watchdog(ctx: SessionContext, state: Arc<Mutex<SessionState>>) {
             "idle timeout reached; feeding synthetic end-prompt to llm"
         );
 
+        let prompt = prompt.clone();
         let ctx_for_pipeline = ctx.clone();
         let state_for_pipeline = state.clone();
         let handle = tokio::spawn(async move {
