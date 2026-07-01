@@ -7,9 +7,7 @@ mod session;
 mod speaker_id;
 mod text_filter;
 
-use std::path::Path;
-
-use anyhow::{Context, bail};
+use anyhow::Context;
 use config::Config;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,26 +30,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn init_onnx_runtime() -> anyhow::Result<()> {
-    if !vad_enabled_from_env() {
+    if !vad_enabled_from_env() && !speaker_id_enabled_from_env() {
         return Ok(());
     }
 
-    let dylib_path = std::env::var("ORT_DYLIB_PATH")
-        .ok()
-        .filter(|path| !path.is_empty())
-        .or_else(|| option_env!("ORT_DYLIB_PATH").map(ToOwned::to_owned))
-        .context(
-            "ORT_DYLIB_PATH is not set; run through nix-shell/direnv so shell.nix can provide onnxruntime",
-        )?;
-
-    if !Path::new(&dylib_path).exists() {
-        bail!("ORT_DYLIB_PATH does not exist: {dylib_path}");
-    }
-
-    ort::init_from(&dylib_path)
+    ort::init()
         .commit()
-        .context("load ONNX Runtime dynamic library")?;
-    tracing::info!(%dylib_path, "ONNX Runtime initialized");
+        .context("load ONNX Runtime dynamic library; make sure libonnxruntime.so is on LD_LIBRARY_PATH")?;
+    tracing::info!("ONNX Runtime initialized");
     Ok(())
 }
 
@@ -65,6 +51,16 @@ fn vad_enabled_from_env() -> bool {
     )
 }
 
+fn speaker_id_enabled_from_env() -> bool {
+    let provider = std::env::var("XIAOZHI_SPEAKER_PROVIDER")
+        .or_else(|_| std::env::var("SPEAKER_PROVIDER"))
+        .unwrap_or_else(|_| "none".to_string())
+        .to_ascii_lowercase();
+    !matches!(
+        provider.as_str(),
+        "none" | "off" | "disabled" | "false" | "0"
+    )
+}
 fn install_rustls_crypto_provider() {
     // tokio-tungstenite uses rustls for Volcengine's wss:// endpoint. With
     // rustls 0.23 the process must pick a crypto provider before any TLS config
