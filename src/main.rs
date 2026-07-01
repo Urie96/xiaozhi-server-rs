@@ -4,6 +4,7 @@ mod http;
 mod protocol;
 mod services;
 mod session;
+mod speaker_id;
 mod text_filter;
 
 use std::path::Path;

@@ -13,6 +13,7 @@ use futures_util::Stream;
 use crate::{
     audio::silero_vad::{SileroVadConfig, SileroVadService},
     protocol::AudioFrame,
+    speaker_id::{SpeakerIdConfig, SpeakerIdService},
 };
 
 use self::{
@@ -49,6 +50,8 @@ pub struct LlmSessionMeta {
     pub session_id: String,
     pub device_id: Option<String>,
     pub client_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub speaker_name: Option<String>,
 }
 
 #[async_trait]
@@ -86,6 +89,7 @@ pub struct ServiceBundle {
     pub llm: Arc<dyn LlmSessionFactory>,
     pub tts: Arc<dyn TtsService>,
     pub vad: Option<Arc<SileroVadService>>,
+    pub speaker_id: Option<Arc<SpeakerIdService>>,
 }
 
 impl ServiceBundle {
@@ -143,6 +147,23 @@ impl ServiceBundle {
             }
         };
 
+        let speaker_id = match SpeakerIdConfig::from_env()? {
+            Some(config) => {
+                tracing::info!(
+                    model_path = %config.model_path.display(),
+                    db_dir = %config.db_dir.display(),
+                    default_agent_id = %config.default_agent_id,
+                    min_similarity = config.min_similarity,
+                    "using speaker identification"
+                );
+                Some(Arc::new(SpeakerIdService::new(config)?))
+            }
+            None => {
+                tracing::info!("speaker identification disabled");
+                None
+            }
+        };
+
         let llm: Arc<dyn LlmSessionFactory> = if let Some(config) = PiHttpLlmConfig::from_env()? {
             tracing::info!(
                 base_url = %config.base_url,
@@ -165,6 +186,6 @@ impl ServiceBundle {
             Arc::new(MockLlmFactory)
         };
 
-        Ok(Self { asr, llm, tts, vad })
+        Ok(Self { asr, llm, tts, vad, speaker_id })
     }
 }

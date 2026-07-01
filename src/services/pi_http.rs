@@ -141,16 +141,18 @@ async fn run_chat_request(
 ) -> Result<()> {
     let url = config.chat_url();
     let started = Instant::now();
+    let agent_id = meta.agent_id.as_deref().unwrap_or(&config.agent_id);
     tracing::debug!(
         session_id = %meta.session_id,
         url = %url,
-        agent_id = %config.agent_id,
+        agent_id = %agent_id,
+        speaker_name = ?meta.speaker_name,
         "starting pi-server LLM stream request"
     );
 
     let response = client
         .post(&url)
-        .bearer_auth(&config.agent_id)
+        .bearer_auth(agent_id)
         .header(reqwest::header::ACCEPT, "text/event-stream")
         .json(&serde_json::json!({ "prompt": prompt }))
         .send()

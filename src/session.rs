@@ -4,6 +4,7 @@ use std::{
     time::Instant,
 };
 
+use anyhow::Context;
 use async_stream::try_stream;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
@@ -23,6 +24,7 @@ use crate::{
     },
     protocol::{self, BinaryProtocolVersion, decode_audio_frame, encode_audio_frame},
     services::{AsrStream, LlmSession, LlmSessionMeta, ServiceBundle, TextStream, TtsEvent},
+    speaker_id::SpeakerTurnIdentity,
     text_filter::filter_tts_text_stream,
 };
 
@@ -94,6 +96,9 @@ struct SessionState {
     /// Holds the most recent PCM samples (FIFO, fixed capacity) until VAD
     /// triggers, so the ASR session can be primed with the leading audio.
     pcm_ring_buffer: Option<PcmRingBuffer>,
+    /// Full decoded PCM for the current listen round. Reused for speaker
+    /// identification after ASR finishes.
+    turn_pcm: Option<Vec<i16>>,
     listen_timeout: Option<JoinHandle<()>>,
     pipeline: Option<JoinHandle<()>>,
     listen_started_at: Option<Instant>,
@@ -113,6 +118,11 @@ struct SessionState {
     /// user explicitly entered listening (`listen.start`). Used by the
     /// idle watchdog to decide when to fire a synthetic goodbye.
     last_voice_ts: Option<Instant>,
+    /// Bound websocket speaker identity. The first recognized speaker fixes
+    /// the websocket's agent choice; later turns only add context when a
+    /// different speaker talks through the same websocket.
+    bound_speaker_name: Option<String>,
+    bound_agent_id: Option<String>,
     /// Owns the LLM session for the lifetime of the WebSocket connection.
     ///
     /// Held behind `Arc<Mutex<...>>` so the in-flight `run_pipeline` task can
@@ -170,6 +180,7 @@ struct SessionContext {
     version: Arc<Mutex<BinaryProtocolVersion>>,
     tx: mpsc::Sender<Outbound>,
     services: ServiceBundle,
+    session_meta: SessionMeta,
     /// Signals `handle_websocket` to break out of its main receive loop
     /// and tear down the connection. Used by the conversation pipeline
     /// once an exit-intent round has finished playing its goodbye audio.
@@ -196,23 +207,7 @@ pub async fn handle_websocket(
         "websocket session connected"
     );
 
-    let llm_meta = LlmSessionMeta {
-        session_id: session_id.clone(),
-        device_id: meta.device_id.clone(),
-        client_id: meta.client_id.clone(),
-    };
-    let llm = match services.llm.create_session(llm_meta).await {
-        Ok(llm) => {
-            tracing::info!(session_id, "llm session created");
-            Some(llm)
-        }
-        Err(err) => {
-            let error_chain = format_error_chain(err.as_ref());
-            tracing::warn!(session_id, error_chain, "failed to create llm session");
-            None
-        }
-    };
-    let llm_slot = Arc::new(Mutex::new(llm));
+    let llm_slot = Arc::new(Mutex::new(None));
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(128);
@@ -289,6 +284,7 @@ pub async fn handle_websocket(
         version: Arc::new(Mutex::new(protocol_version)),
         tx: out_tx.clone(),
         services,
+        session_meta: meta.clone(),
         shutdown_tx: shutdown_tx.clone(),
     };
     let state = Arc::new(Mutex::new(SessionState {
@@ -466,6 +462,7 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                 guard.audio_decoder = Some(audio_decoder);
                 guard.vad = vad;
                 guard.pcm_ring_buffer = Some(PcmRingBuffer::new(PCM_RING_BUFFER_SAMPLES));
+                guard.turn_pcm = Some(Vec::new());
                 guard.listen_started_at = Some(Instant::now());
                 guard.first_audio_logged = false;
                 guard.input_frames = 0;
@@ -558,6 +555,10 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
         }
         None => return,
     };
+
+    if let Some(turn_pcm) = guard.turn_pcm.as_mut() {
+        turn_pcm.extend_from_slice(&samples);
+    }
 
     if let Some(asr) = guard.asr.as_mut() {
         if let Err(err) = asr.push_pcm(&samples).await {
@@ -667,7 +668,7 @@ async fn finish_listening(
     reason: &'static str,
     abort_timeout: bool,
 ) {
-    let (asr, timeout, listen_elapsed_ms, input_frames) = {
+    let (asr, timeout, listen_elapsed_ms, input_frames, turn_pcm) = {
         let mut guard = state.lock().await;
         guard.listening = false;
         let listen_elapsed_ms = guard
@@ -675,7 +676,7 @@ async fn finish_listening(
             .map(|started| started.elapsed().as_millis());
         let input_frames = guard.input_frames;
         if guard.already_triggered {
-            (None, None, listen_elapsed_ms, input_frames)
+            (None, None, listen_elapsed_ms, input_frames, None)
         } else {
             guard.already_triggered = true;
             guard.listen_started_at = None;
@@ -693,6 +694,7 @@ async fn finish_listening(
                 },
                 listen_elapsed_ms,
                 input_frames,
+                guard.turn_pcm.take(),
             )
         }
     };
@@ -709,7 +711,7 @@ async fn finish_listening(
         "listen finished"
     );
     if let Some(asr) = asr {
-        trigger_conversation(ctx, state, asr).await;
+        trigger_conversation(ctx, state, asr, turn_pcm).await;
     }
 }
 
@@ -717,12 +719,13 @@ async fn trigger_conversation(
     ctx: SessionContext,
     state: Arc<Mutex<SessionState>>,
     asr: Box<dyn AsrStream>,
+    turn_pcm: Option<Vec<i16>>,
 ) {
     tracing::info!(session_id = ctx.id, "starting conversation pipeline");
     let pipeline_ctx = ctx.clone();
     let pipeline_state = state.clone();
     let handle = tokio::spawn(async move {
-        if let Err(err) = run_pipeline(pipeline_ctx.clone(), pipeline_state, asr).await {
+        if let Err(err) = run_pipeline(pipeline_ctx.clone(), pipeline_state, asr, turn_pcm).await {
             let error_chain = format_error_chain(err.as_ref());
             tracing::error!(
                 session_id = pipeline_ctx.id,
@@ -759,6 +762,7 @@ async fn run_pipeline(
     ctx: SessionContext,
     state: Arc<Mutex<SessionState>>,
     mut asr: Box<dyn AsrStream>,
+    turn_pcm: Option<Vec<i16>>,
 ) -> anyhow::Result<()> {
     let pipeline_started = Instant::now();
     tracing::debug!(session_id = ctx.id, "pipeline timing started");
@@ -796,7 +800,7 @@ async fn run_pipeline(
         "asr finish returned final text"
     );
 
-    run_pipeline_with_text(ctx, state, pipeline_started, text).await
+    run_pipeline_with_text(ctx, state, pipeline_started, text, turn_pcm).await
 }
 
 async fn run_pipeline_with_text(
@@ -804,6 +808,7 @@ async fn run_pipeline_with_text(
     state: Arc<Mutex<SessionState>>,
     pipeline_started: Instant,
     text: String,
+    turn_pcm: Option<Vec<i16>>,
 ) -> anyhow::Result<()> {
     // Abort notifier is cloned here and again inside the loop. We hold a
     // `Notified` future for the *outer* wait (during ASR finish) so that an
@@ -835,23 +840,21 @@ async fn run_pipeline_with_text(
             total_elapsed_ms = pipeline_started.elapsed().as_millis(),
             "asr returned empty text; skipping llm and returning to listen"
         );
-        // Send a paired `tts.start` + `tts.stop` so the client
-        // transitions through `kDeviceStateSpeaking` and back to
-        // `kDeviceStateListening`. The ESP32 firmware only acts on
-        // `tts.stop` when it is currently in `kDeviceStateSpeaking`,
-        // and the transition into `kDeviceStateListening` is what
-        // triggers it to re-send `listen.start`. Without `tts.start`
-        // first, the client stays in `kDeviceStateListening` (its
-        // state never changes), never re-sends `listen.start`, and
-        // every subsequent audio frame is dropped server-side by
-        // `discarding audio while not listening`. This is the
-        // "ASR returned empty text and nothing responds afterwards"
-        // failure mode.
         send_json(&ctx, protocol::tts_start(&ctx.id)).await;
         send_json(&ctx, protocol::tts_stop(&ctx.id)).await;
         maybe_schedule_close_after_chat(&ctx, &state, false).await;
         return Ok(());
     }
+
+    let routing = resolve_turn_routing(&ctx, &state, turn_pcm.as_deref()).await;
+    let prompt = {
+        let guard = state.lock().await;
+        wrap_user_prompt(
+            &text,
+            routing.as_ref(),
+            guard.bound_speaker_name.as_deref(),
+        )
+    };
 
     send_json(&ctx, protocol::stt(&ctx.id, &text)).await;
     send_json(&ctx, protocol::llm_emotion(&ctx.id, "happy", "😊")).await;
@@ -869,11 +872,12 @@ async fn run_pipeline_with_text(
     // is what guarantees `abort_active` can always reach the LLM to abort
     // the active provider request, and that the LLM session is never dropped
     // because the pipeline task was cancelled.
+    ensure_llm_session(&ctx, &state, routing.as_ref()).await?;
     let llm_slot = state.lock().await.llm.clone();
     let raw_llm_stream = {
         let mut guard = llm_slot.lock().await;
         match guard.as_mut() {
-            Some(llm) => llm.chat_stream(text),
+            Some(llm) => llm.chat_stream(prompt),
             None => {
                 tracing::error!(
                     session_id = ctx.id,
@@ -1130,6 +1134,7 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
         guard.audio_decoder = None;
         guard.vad = None;
         guard.pcm_ring_buffer = None;
+        guard.turn_pcm = None;
         guard.listen_started_at = None;
         guard.first_audio_logged = false;
         guard.input_frames = 0;
@@ -1242,6 +1247,118 @@ async fn complete_ws_probe(state: &Arc<Mutex<SessionState>>, pong: &Bytes) -> bo
 
     let _ = probe.done_tx.send(());
     true
+}
+
+async fn resolve_turn_routing(
+    ctx: &SessionContext,
+    state: &Arc<Mutex<SessionState>>,
+    turn_pcm: Option<&[i16]>,
+) -> Option<SpeakerTurnIdentity> {
+    let Some(turn_pcm) = turn_pcm else {
+        return None;
+    };
+    let speaker_id = ctx.services.speaker_id.as_ref()?;
+    match speaker_id.identify_turn(turn_pcm).await {
+        Ok(Some(identity)) => {
+            tracing::info!(
+                session_id = ctx.id,
+                speaker_name = ?identity.speaker_name,
+                agent_id = %identity.agent_id,
+                similarity = identity.similarity,
+                "speaker identified for turn"
+            );
+            let mut guard = state.lock().await;
+            if guard.bound_agent_id.is_none() {
+                guard.bound_agent_id = Some(identity.agent_id.clone());
+                guard.bound_speaker_name = identity.speaker_name.clone();
+                tracing::info!(
+                    session_id = ctx.id,
+                    speaker_name = ?guard.bound_speaker_name,
+                    agent_id = ?guard.bound_agent_id,
+                    "websocket bound to speaker"
+                );
+            }
+            Some(identity)
+        }
+        Ok(None) => None,
+        Err(err) => {
+            let error_chain = format_error_chain(err.as_ref());
+            tracing::warn!(session_id = ctx.id, error_chain, "speaker identification failed");
+            None
+        }
+    }
+}
+
+async fn ensure_llm_session(
+    ctx: &SessionContext,
+    state: &Arc<Mutex<SessionState>>,
+    routing: Option<&SpeakerTurnIdentity>,
+) -> anyhow::Result<()> {
+    let llm_slot = state.lock().await.llm.clone();
+    if llm_slot.lock().await.is_some() {
+        return Ok(());
+    }
+
+    let agent_id = {
+        let guard = state.lock().await;
+        guard
+            .bound_agent_id
+            .clone()
+            .or_else(|| routing.map(|r| r.agent_id.clone()))
+            .unwrap_or_else(|| {
+                ctx.services
+                    .speaker_id
+                    .as_ref()
+                    .map(|svc| svc.default_agent_id().to_string())
+                    .unwrap_or_else(|| "zhuzhu".to_string())
+            })
+    };
+
+    let session_meta = LlmSessionMeta {
+        session_id: ctx.id.clone(),
+        device_id: ctx.session_meta.device_id.clone(),
+        client_id: ctx.session_meta.client_id.clone(),
+        agent_id: Some(agent_id.clone()),
+        speaker_name: routing.and_then(|r| r.speaker_name.clone()),
+    };
+
+    let llm = ctx
+        .services
+        .llm
+        .create_session(session_meta)
+        .await
+        .context("create llm session")?;
+
+    let mut guard = llm_slot.lock().await;
+    if guard.is_none() {
+        *guard = Some(llm);
+        let mut state_guard = state.lock().await;
+        if state_guard.bound_agent_id.is_none() {
+            state_guard.bound_agent_id = Some(agent_id.clone());
+        }
+        tracing::info!(session_id = ctx.id, agent_id = %agent_id, "llm session created");
+    }
+    Ok(())
+}
+
+fn wrap_user_prompt(
+    text: &str,
+    routing: Option<&SpeakerTurnIdentity>,
+    bound_speaker_name: Option<&str>,
+) -> String {
+    let Some(routing) = routing else {
+        return text.to_string();
+    };
+
+    let speaker_name = routing
+        .speaker_name
+        .as_deref()
+        .unwrap_or("unknown-speaker");
+    if bound_speaker_name.is_some_and(|bound| bound == speaker_name) {
+        return text.to_string();
+    }
+
+    format!("[speaker={speaker_name}; similarity={:.3}] {text}", routing.similarity)
 }
 
 fn listen_max_timeout() -> Duration {
@@ -1418,6 +1535,7 @@ async fn idle_watchdog(ctx: SessionContext, state: Arc<Mutex<SessionState>>) {
                 state_for_pipeline.clone(),
                 pipeline_started,
                 prompt,
+                None,
             )
             .await
             {
