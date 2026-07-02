@@ -186,6 +186,12 @@ impl ServiceBundle {
             Arc::new(MockLlmFactory)
         };
 
-        Ok(Self { asr, llm, tts, vad, speaker_id })
+        Ok(Self {
+            asr,
+            llm,
+            tts,
+            vad,
+            speaker_id,
+        })
     }
 }

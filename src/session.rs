@@ -74,6 +74,11 @@ const UNKNOWN_SPEAKER_CANNED_RESPONSE: &str =
 /// 1 second @ 16 kHz mono = 16 000 samples of i16 (~32 KB).
 const PCM_RING_BUFFER_SAMPLES: usize = 16_000;
 
+/// Extra audio kept around the VAD-reported speech boundaries for speaker
+/// identification and saved enrollment WAVs. This compensates for VAD debounce
+/// latency without keeping the long listen-start/listen-end silence.
+const TURN_PCM_VAD_PAD_SAMPLES: usize = 4_000;
+
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub device_id: Option<String>,
@@ -105,9 +110,12 @@ struct SessionState {
     /// Holds the most recent PCM samples (FIFO, fixed capacity) until VAD
     /// triggers, so the ASR session can be primed with the leading audio.
     pcm_ring_buffer: Option<PcmRingBuffer>,
-    /// Full decoded PCM for the current listen round. Reused for speaker
-    /// identification after ASR finishes.
+    /// Full decoded PCM for the current listen round while listening. It is
+    /// cropped to the VAD-confirmed speech span before speaker identification
+    /// and optional WAV enrollment saves.
     turn_pcm: Option<Vec<i16>>,
+    vad_speech_start_sample: Option<usize>,
+    vad_speech_end_sample: Option<usize>,
     listen_timeout: Option<JoinHandle<()>>,
     pipeline: Option<JoinHandle<()>>,
     listen_started_at: Option<Instant>,
@@ -472,6 +480,8 @@ async fn handle_text(text: String, ctx: &SessionContext, state: &Arc<Mutex<Sessi
                 guard.vad = vad;
                 guard.pcm_ring_buffer = Some(PcmRingBuffer::new(PCM_RING_BUFFER_SAMPLES));
                 guard.turn_pcm = Some(Vec::new());
+                guard.vad_speech_start_sample = None;
+                guard.vad_speech_end_sample = None;
                 guard.listen_started_at = Some(Instant::now());
                 guard.first_audio_logged = false;
                 guard.input_frames = 0;
@@ -592,6 +602,7 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
                 for event in events {
                     match event {
                         VadEvent::SpeechStart { sample } => {
+                            guard.vad_speech_start_sample = Some(sample);
                             tracing::info!(
                                 session_id = ctx.id,
                                 sample,
@@ -639,6 +650,8 @@ async fn handle_binary(data: &[u8], ctx: &SessionContext, state: &Arc<Mutex<Sess
                             start_sample,
                             end_sample,
                         } => {
+                            guard.vad_speech_start_sample.get_or_insert(start_sample);
+                            guard.vad_speech_end_sample = Some(end_sample);
                             tracing::info!(
                                 session_id = ctx.id,
                                 start_sample,
@@ -692,8 +705,16 @@ async fn finish_listening(
             guard.first_audio_logged = false;
             guard.input_frames = 0;
             guard.audio_decoder = None;
-            guard.vad = None;
+            let vad_was_enabled = guard.vad.take().is_some();
             guard.pcm_ring_buffer = None;
+            let speech_start = guard.vad_speech_start_sample.take();
+            let speech_end = guard.vad_speech_end_sample.take();
+            let turn_pcm = crop_turn_pcm_for_speaker_id(
+                guard.turn_pcm.take(),
+                vad_was_enabled,
+                speech_start,
+                speech_end,
+            );
             (
                 guard.asr.take(),
                 if abort_timeout {
@@ -703,7 +724,7 @@ async fn finish_listening(
                 },
                 listen_elapsed_ms,
                 input_frames,
-                guard.turn_pcm.take(),
+                turn_pcm,
             )
         }
     };
@@ -720,7 +741,7 @@ async fn finish_listening(
         "listen finished"
     );
 
-    // Optionally save turn PCM to WAV for offline voiceprint enrollment.
+    // Optionally save VAD-confirmed speech PCM to WAV for offline voiceprint enrollment.
     if let Some(ref pcm) = turn_pcm {
         if let Some(dir) = save_audio_dir() {
             if let Err(err) = save_turn_audio(&dir, &ctx.id, pcm) {
@@ -736,6 +757,30 @@ async fn finish_listening(
     if let Some(asr) = asr {
         trigger_conversation(ctx, state, asr, turn_pcm).await;
     }
+}
+
+fn crop_turn_pcm_for_speaker_id(
+    pcm: Option<Vec<i16>>,
+    vad_was_enabled: bool,
+    speech_start: Option<usize>,
+    speech_end: Option<usize>,
+) -> Option<Vec<i16>> {
+    let pcm = pcm?;
+    if pcm.is_empty() || !vad_was_enabled {
+        return (!pcm.is_empty()).then_some(pcm);
+    }
+
+    let start = speech_start?;
+    let end = speech_end.unwrap_or(pcm.len()).min(pcm.len());
+    if end <= start {
+        return None;
+    }
+
+    let from = start
+        .saturating_sub(TURN_PCM_VAD_PAD_SAMPLES)
+        .min(pcm.len());
+    let to = end.saturating_add(TURN_PCM_VAD_PAD_SAMPLES).min(pcm.len());
+    (to > from).then(|| pcm[from..to].to_vec())
 }
 
 async fn trigger_conversation(
@@ -897,10 +942,7 @@ async fn run_pipeline_with_text(
                 })
             } else {
                 drop(guard);
-                send_canned_unknown_speaker_response(
-                    &ctx, &state, &text, pipeline_started,
-                )
-                .await?;
+                send_canned_unknown_speaker_response(&ctx, &state, &text, pipeline_started).await?;
                 return Ok(());
             }
         }
@@ -908,11 +950,7 @@ async fn run_pipeline_with_text(
     };
     let prompt = {
         let guard = state.lock().await;
-        wrap_user_prompt(
-            &text,
-            routing.as_ref(),
-            guard.bound_speaker_name.as_deref(),
-        )
+        wrap_user_prompt(&text, routing.as_ref(), guard.bound_speaker_name.as_deref())
     };
 
     send_json(&ctx, protocol::stt(&ctx.id, &text)).await;
@@ -1103,8 +1141,7 @@ async fn send_canned_unknown_speaker_response(
     send_json(ctx, protocol::tts_start(&ctx.id)).await;
 
     let canned = UNKNOWN_SPEAKER_CANNED_RESPONSE.to_string();
-    let text_stream: TextStream =
-        Box::pin(futures_util::stream::once(async move { Ok(canned) }));
+    let text_stream: TextStream = Box::pin(futures_util::stream::once(async move { Ok(canned) }));
     let mut tts_stream = ctx.services.tts.synthesize_stream(text_stream);
 
     let mut audio_frames = 0u64;
@@ -1138,12 +1175,7 @@ async fn send_canned_unknown_speaker_response(
                 audio_frames = audio_frames.saturating_add(1);
                 let version = *ctx.version.lock().await;
                 let bytes = encode_audio_frame(version, &frame);
-                if ctx
-                    .tx
-                    .send(Outbound::Binary(bytes))
-                    .await
-                    .is_err()
-                {
+                if ctx.tx.send(Outbound::Binary(bytes)).await.is_err() {
                     break;
                 }
             }
@@ -1279,6 +1311,8 @@ async fn abort_active(ctx: &SessionContext, state: &Arc<Mutex<SessionState>>, se
         guard.vad = None;
         guard.pcm_ring_buffer = None;
         guard.turn_pcm = None;
+        guard.vad_speech_start_sample = None;
+        guard.vad_speech_end_sample = None;
         guard.listen_started_at = None;
         guard.first_audio_logged = false;
         guard.input_frames = 0;
@@ -1427,7 +1461,11 @@ async fn resolve_turn_routing(
         Ok(None) => None,
         Err(err) => {
             let error_chain = format_error_chain(err.as_ref());
-            tracing::warn!(session_id = ctx.id, error_chain, "speaker identification failed");
+            tracing::warn!(
+                session_id = ctx.id,
+                error_chain,
+                "speaker identification failed"
+            );
             None
         }
     }
@@ -1494,15 +1532,15 @@ fn wrap_user_prompt(
         return text.to_string();
     };
 
-    let speaker_name = routing
-        .speaker_name
-        .as_deref()
-        .unwrap_or("unknown-speaker");
+    let speaker_name = routing.speaker_name.as_deref().unwrap_or("unknown-speaker");
     if bound_speaker_name.is_some_and(|bound| bound == speaker_name) {
         return text.to_string();
     }
 
-    format!("[speaker={speaker_name}; similarity={:.3}] {text}", routing.similarity)
+    format!(
+        "[speaker={speaker_name}; similarity={:.3}] {text}",
+        routing.similarity
+    )
 }
 
 fn listen_max_timeout() -> Duration {
@@ -1565,7 +1603,7 @@ fn end_prompt_enabled() -> bool {
     )
 }
 
-/// Returns the directory where turn audio WAV files should be saved, if
+/// Returns the directory where speech audio WAV files should be saved, if
 /// the feature is enabled via `XIAOZHI_SAVE_AUDIO_DIR`. When the env var
 /// is absent or empty the feature is disabled (the default).
 fn save_audio_dir() -> Option<PathBuf> {
@@ -1575,11 +1613,10 @@ fn save_audio_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Write PCM i16 samples (16 kHz, mono) to a WAV file in `dir`.
+/// Write VAD-confirmed PCM i16 samples (16 kHz, mono) to a WAV file in `dir`.
 /// The filename is `{session_id}_{unix_millis}.wav`.
 fn save_turn_audio(dir: &Path, session_id: &str, pcm: &[i16]) -> anyhow::Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("create audio save dir {}", dir.display()))?;
+    fs::create_dir_all(dir).with_context(|| format!("create audio save dir {}", dir.display()))?;
 
     let ts_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1594,21 +1631,22 @@ fn save_turn_audio(dir: &Path, session_id: &str, pcm: &[i16]) -> anyhow::Result<
         bits_per_sample: 16,
         sample_format: SampleFormat::Int,
     };
-    let mut writer = WavWriter::create(&path, spec)
-        .with_context(|| format!("create wav {}", path.display()))?;
+    let mut writer =
+        WavWriter::create(&path, spec).with_context(|| format!("create wav {}", path.display()))?;
     for &sample in pcm {
         writer
             .write_sample(sample)
             .with_context(|| format!("write sample to wav {}", path.display()))?;
     }
-    writer.finalize()
+    writer
+        .finalize()
         .with_context(|| format!("finalize wav {}", path.display()))?;
 
     tracing::info!(
         session_id,
         path = %path.display(),
         samples = pcm.len(),
-        "saved turn audio to wav"
+        "saved speech audio to wav"
     );
     Ok(())
 }
@@ -1906,5 +1944,34 @@ mod tests {
                 None => std::env::remove_var("XIAOZHI_END_PROMPT_ENABLED"),
             }
         }
+    }
+
+    #[test]
+    fn crop_turn_pcm_uses_vad_speech_bounds_with_padding() {
+        let pcm: Vec<i16> = (0..12_000).map(|sample| sample as i16).collect();
+        let cropped = crop_turn_pcm_for_speaker_id(Some(pcm), true, Some(5_000), Some(7_000))
+            .expect("cropped speech pcm");
+
+        assert_eq!(cropped.first().copied(), Some(1_000));
+        assert_eq!(cropped.last().copied(), Some(10_999));
+        assert_eq!(cropped.len(), 10_000);
+    }
+
+    #[test]
+    fn crop_turn_pcm_keeps_full_audio_without_vad() {
+        let pcm = vec![1, 2, 3, 4];
+        assert_eq!(
+            crop_turn_pcm_for_speaker_id(Some(pcm.clone()), false, None, None),
+            Some(pcm)
+        );
+    }
+
+    #[test]
+    fn crop_turn_pcm_drops_audio_when_vad_never_confirmed_speech() {
+        let pcm = vec![1, 2, 3, 4];
+        assert_eq!(
+            crop_turn_pcm_for_speaker_id(Some(pcm), true, None, None),
+            None
+        );
     }
 }

@@ -34,9 +34,9 @@ fn init_onnx_runtime() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    ort::init()
-        .commit()
-        .context("load ONNX Runtime dynamic library; make sure libonnxruntime.so is on LD_LIBRARY_PATH")?;
+    ort::init().commit().context(
+        "load ONNX Runtime dynamic library; make sure libonnxruntime.so is on LD_LIBRARY_PATH",
+    )?;
     tracing::info!("ONNX Runtime initialized");
     Ok(())
 }

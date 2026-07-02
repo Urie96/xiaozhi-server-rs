@@ -1,4 +1,9 @@
-use std::{collections::HashMap, fs, path::{Path, PathBuf}, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use hound;
@@ -25,7 +30,10 @@ impl SpeakerIdConfig {
         let provider = env_any(&["XIAOZHI_SPEAKER_PROVIDER", "SPEAKER_PROVIDER"])
             .unwrap_or_else(|| "none".to_string())
             .to_ascii_lowercase();
-        if matches!(provider.as_str(), "none" | "off" | "disabled" | "false" | "0") {
+        if matches!(
+            provider.as_str(),
+            "none" | "off" | "disabled" | "false" | "0"
+        ) {
             return Ok(None);
         }
         if !matches!(provider.as_str(), "speaker_id" | "speaker" | "voiceprint") {
@@ -42,10 +50,7 @@ impl SpeakerIdConfig {
         ])
         .unwrap_or_else(|| DEFAULT_AGENT_ID.to_string());
         let min_similarity = env_f32_any(
-            &[
-                "XIAOZHI_SPEAKER_MIN_SIMILARITY",
-                "SPEAKER_MIN_SIMILARITY",
-            ],
+            &["XIAOZHI_SPEAKER_MIN_SIMILARITY", "SPEAKER_MIN_SIMILARITY"],
             DEFAULT_SIMILARITY_THRESHOLD,
         );
 
@@ -118,8 +123,8 @@ impl SpeakerRegistry {
     fn from_wavs(db_dir: &Path, embedder: &mut SpeakerEmbedder) -> Result<Self> {
         let mut speakers = Vec::new();
         if db_dir.exists() {
-            let entries = fs::read_dir(db_dir)
-                .with_context(|| format!("read {}", db_dir.display()))?;
+            let entries =
+                fs::read_dir(db_dir).with_context(|| format!("read {}", db_dir.display()))?;
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("wav") {
@@ -156,7 +161,10 @@ impl SpeakerRegistry {
             agent_map_entries = agent_map.len(),
             "speaker database loaded from wavs"
         );
-        Ok(Self { speakers, agent_map })
+        Ok(Self {
+            speakers,
+            agent_map,
+        })
     }
 
     fn identify(
@@ -373,13 +381,14 @@ fn register_speaker_from_wav(
     name: &str,
     embedder: &mut SpeakerEmbedder,
 ) -> Result<RegisteredSpeaker> {
-    let samples = read_wav_16khz_mono(path)
-        .with_context(|| format!("read wav {}", path.display()))?;
+    let samples =
+        read_wav_16khz_mono(path).with_context(|| format!("read wav {}", path.display()))?;
     let pcm: Vec<i16> = samples
         .iter()
         .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect();
-    let embedding = embedder.embed_pcm(&pcm)
+    let embedding = embedder
+        .embed_pcm(&pcm)
         .with_context(|| format!("embed speaker {}", path.display()))?;
     Ok(RegisteredSpeaker {
         name: name.to_string(),
@@ -388,8 +397,8 @@ fn register_speaker_from_wav(
 }
 
 fn read_wav_16khz_mono(path: &Path) -> Result<Vec<f32>> {
-    let mut reader = hound::WavReader::open(path)
-        .with_context(|| format!("open WAV {}", path.display()))?;
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("open WAV {}", path.display()))?;
     let spec = reader.spec();
 
     let samples: Vec<f32> = match spec.sample_format {
@@ -518,7 +527,13 @@ fn apply_cmvn(frames: &[Vec<f32>]) -> Vec<Vec<f32>> {
 
     frames
         .iter()
-        .map(|frame| frame.iter().zip(means.iter()).map(|(&v, &m)| v - m).collect())
+        .map(|frame| {
+            frame
+                .iter()
+                .zip(means.iter())
+                .map(|(&v, &m)| v - m)
+                .collect()
+        })
         .collect()
 }
 
@@ -547,14 +562,14 @@ fn env_f32_any(names: &[&str], default: f32) -> f32 {
         .unwrap_or(default)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parses_agent_map_json() {
-        let map: HashMap<String, String> = serde_json::from_str(r#"{"alice":"agent-a","bob":"agent-b"}"#).unwrap();
+        let map: HashMap<String, String> =
+            serde_json::from_str(r#"{"alice":"agent-a","bob":"agent-b"}"#).unwrap();
         assert_eq!(map.get("alice").map(String::as_str), Some("agent-a"));
         assert_eq!(map.get("bob").map(String::as_str), Some("agent-b"));
     }
