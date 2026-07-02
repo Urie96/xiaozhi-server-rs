@@ -59,6 +59,12 @@ const DEFAULT_EXIT_COMMANDS: &[&str] = &["退出", "关闭"];
 const DEFAULT_END_PROMPT: &str =
     "请你以\"时间过得真快\"开头，用富有感情、依依不舍的话来结束这场对话吧！";
 
+/// Canned TTS response sent when speaker identification is enabled but
+/// no speaker could be matched, and no previous speaker has been bound
+/// in this session. Skips the LLM entirely.
+const UNKNOWN_SPEAKER_CANNED_RESPONSE: &str =
+    "咦，你是谁呀？我好像还不认识你呢！告诉我你的名字，我就能记住你啦～";
+
 /// Fixed-size PCM ring buffer used as a pre-roll for ASR: it keeps the most
 /// recent ~1 second of decoded PCM samples so that when VAD finally confirms
 /// speech onset, ASR receives the audio leading up to (and including) the
@@ -864,6 +870,42 @@ async fn run_pipeline_with_text(
     }
 
     let routing = resolve_turn_routing(&ctx, &state, turn_pcm.as_deref()).await;
+
+    // When speaker identification ran but didn't match anyone:
+    // - If the session already has a bound speaker, fall back to it.
+    // - Otherwise (first-time unrecognized), send a canned voice
+    //   response asking who's speaking, without involving the LLM.
+    let routing = match routing {
+        Some(ref r) if r.speaker_name.is_none() => {
+            let guard = state.lock().await;
+            if let (Some(bound_name), Some(bound_agent)) =
+                (&guard.bound_speaker_name, &guard.bound_agent_id)
+            {
+                let bound_name = bound_name.clone();
+                let bound_agent = bound_agent.clone();
+                tracing::info!(
+                    session_id = ctx.id,
+                    speaker_name = %bound_name,
+                    agent_id = %bound_agent,
+                    "speaker not identified this turn; falling back to bound speaker"
+                );
+                drop(guard);
+                Some(SpeakerTurnIdentity {
+                    speaker_name: Some(bound_name),
+                    agent_id: bound_agent,
+                    similarity: r.similarity,
+                })
+            } else {
+                drop(guard);
+                send_canned_unknown_speaker_response(
+                    &ctx, &state, &text, pipeline_started,
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        other => other,
+    };
     let prompt = {
         let guard = state.lock().await;
         wrap_user_prompt(
@@ -1032,6 +1074,91 @@ async fn run_pipeline_with_text(
         "pipeline finished"
     );
     maybe_schedule_close_after_chat(&ctx, &state, aborted).await;
+    Ok(())
+}
+
+/// Send a fixed, canned TTS response ("who are you?") when speaker
+/// identification is enabled but the speaker couldn't be matched and no
+/// previous speaker was bound in this session. This bypasses the LLM
+/// entirely so we don't burn inference costs on an unrecognized voice.
+async fn send_canned_unknown_speaker_response(
+    ctx: &SessionContext,
+    state: &Arc<Mutex<SessionState>>,
+    user_text: &str,
+    pipeline_started: Instant,
+) -> anyhow::Result<()> {
+    tracing::info!(
+        session_id = ctx.id,
+        user_text = %user_text,
+        "unrecognized speaker with no bound session; sending canned identity prompt"
+    );
+
+    let abort_notify = {
+        let guard = state.lock().await;
+        guard.abort_notify.clone()
+    };
+
+    send_json(ctx, protocol::stt(&ctx.id, user_text)).await;
+    send_json(ctx, protocol::llm_emotion(&ctx.id, "neutral", "🤔")).await;
+    send_json(ctx, protocol::tts_start(&ctx.id)).await;
+
+    let canned = UNKNOWN_SPEAKER_CANNED_RESPONSE.to_string();
+    let text_stream: TextStream =
+        Box::pin(futures_util::stream::once(async move { Ok(canned) }));
+    let mut tts_stream = ctx.services.tts.synthesize_stream(text_stream);
+
+    let mut audio_frames = 0u64;
+    let mut aborted = false;
+    loop {
+        let next_event = tts_stream.next();
+        tokio::pin!(next_event);
+        let event = tokio::select! {
+            biased;
+            _ = abort_notify.notified() => {
+                tracing::info!(
+                    session_id = ctx.id,
+                    audio_frames,
+                    "canned unknown-speaker response aborted"
+                );
+                aborted = true;
+                break;
+            }
+            event = &mut next_event => event,
+        };
+        let event = match event {
+            Some(Ok(event)) => event,
+            Some(Err(err)) => return Err(err),
+            None => break,
+        };
+        match event {
+            TtsEvent::SentenceStart(text) => {
+                send_json(ctx, protocol::tts_sentence_start(&ctx.id, &text)).await;
+            }
+            TtsEvent::Audio(frame) => {
+                audio_frames = audio_frames.saturating_add(1);
+                let version = *ctx.version.lock().await;
+                let bytes = encode_audio_frame(version, &frame);
+                if ctx
+                    .tx
+                    .send(Outbound::Binary(bytes))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    send_json(ctx, protocol::tts_stop(&ctx.id)).await;
+    tracing::info!(
+        session_id = ctx.id,
+        audio_frames,
+        aborted,
+        total_elapsed_ms = pipeline_started.elapsed().as_millis(),
+        "canned unknown-speaker response finished"
+    );
+    maybe_schedule_close_after_chat(ctx, state, aborted).await;
     Ok(())
 }
 
@@ -1285,7 +1412,7 @@ async fn resolve_turn_routing(
                 "speaker identified for turn"
             );
             let mut guard = state.lock().await;
-            if guard.bound_agent_id.is_none() {
+            if guard.bound_agent_id.is_none() && identity.speaker_name.is_some() {
                 guard.bound_agent_id = Some(identity.agent_id.clone());
                 guard.bound_speaker_name = identity.speaker_name.clone();
                 tracing::info!(
