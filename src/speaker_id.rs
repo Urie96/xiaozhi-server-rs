@@ -16,6 +16,7 @@ const DEFAULT_MODEL_PATH: &str = "models/voxceleb_resnet34.onnx";
 const DEFAULT_DB_DIR: &str = "speakers";
 const DEFAULT_AGENT_ID: &str = "zhuzhu";
 const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.35;
+const SPEAKER_SCORE_TOP_K: usize = 3;
 
 #[derive(Clone, Debug)]
 pub struct SpeakerIdConfig {
@@ -125,30 +126,42 @@ impl SpeakerRegistry {
         if db_dir.exists() {
             let entries =
                 fs::read_dir(db_dir).with_context(|| format!("read {}", db_dir.display()))?;
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("wav") {
+            let mut entries = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>();
+            entries.sort();
+
+            for path in entries {
+                if !path.is_dir() {
                     continue;
                 }
+
                 let name = path
-                    .file_stem()
+                    .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
-                match register_speaker_from_wav(&path, &name, embedder) {
-                    Ok(speaker) => {
+                match register_speaker_from_dir(&path, &name, embedder) {
+                    Ok(Some(speaker)) => {
                         tracing::info!(
                             speaker = %name,
                             path = %path.display(),
-                            dim = speaker.embedding.len(),
-                            "registered speaker from wav"
+                            samples = speaker.embeddings.len(),
+                            dim = speaker.embeddings.first().map_or(0, Vec::len),
+                            "registered speaker from wav samples"
                         );
                         speakers.push(speaker);
                     }
+                    Ok(None) => tracing::warn!(
+                        speaker = %name,
+                        path = %path.display(),
+                        "skip speaker directory without valid wav samples"
+                    ),
                     Err(err) => tracing::warn!(
                         path = %path.display(),
                         error = %err,
-                        "skip invalid speaker wav"
+                        "skip invalid speaker directory"
                     ),
                 }
             }
@@ -159,7 +172,7 @@ impl SpeakerRegistry {
             db_dir = %db_dir.display(),
             speakers = speakers.len(),
             agent_map_entries = agent_map.len(),
-            "speaker database loaded from wavs"
+            "speaker database loaded from speaker directories"
         );
         Ok(Self {
             speakers,
@@ -177,7 +190,7 @@ impl SpeakerRegistry {
         let mut best_sim = -1.0_f32;
 
         for speaker in &self.speakers {
-            let sim = cosine_similarity(embedding, &speaker.embedding);
+            let sim = speaker_similarity(embedding, &speaker.embeddings, SPEAKER_SCORE_TOP_K);
             if sim > best_sim {
                 best_sim = sim;
                 best_name = Some(speaker.name.clone());
@@ -207,6 +220,21 @@ impl SpeakerRegistry {
     }
 }
 
+fn speaker_similarity(query: &[f32], embeddings: &[Vec<f32>], top_k: usize) -> f32 {
+    if embeddings.is_empty() || top_k == 0 {
+        return -1.0;
+    }
+
+    let mut scores = embeddings
+        .iter()
+        .map(|embedding| cosine_similarity(query, embedding))
+        .collect::<Vec<_>>();
+    scores.sort_by(|a, b| b.total_cmp(a));
+
+    let count = scores.len().min(top_k);
+    scores.iter().take(count).sum::<f32>() / count as f32
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
@@ -214,7 +242,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 #[derive(Debug)]
 struct RegisteredSpeaker {
     name: String,
-    embedding: Vec<f32>,
+    embeddings: Vec<Vec<f32>>,
 }
 
 #[derive(Clone)]
@@ -376,24 +404,51 @@ impl SpeakerEmbedder {
     }
 }
 
-fn register_speaker_from_wav(
-    path: &Path,
+fn register_speaker_from_dir(
+    dir: &Path,
     name: &str,
     embedder: &mut SpeakerEmbedder,
-) -> Result<RegisteredSpeaker> {
+) -> Result<Option<RegisteredSpeaker>> {
+    let entries = fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))?;
+    let mut wav_paths = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("wav"))
+        .collect::<Vec<_>>();
+    wav_paths.sort();
+
+    let mut embeddings = Vec::new();
+    for path in wav_paths {
+        match embed_speaker_wav(&path, embedder) {
+            Ok(embedding) => embeddings.push(embedding),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "skip invalid speaker wav sample"
+            ),
+        }
+    }
+
+    if embeddings.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(RegisteredSpeaker {
+        name: name.to_string(),
+        embeddings,
+    }))
+}
+
+fn embed_speaker_wav(path: &Path, embedder: &mut SpeakerEmbedder) -> Result<Vec<f32>> {
     let samples =
         read_wav_16khz_mono(path).with_context(|| format!("read wav {}", path.display()))?;
     let pcm: Vec<i16> = samples
         .iter()
         .map(|&s| (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
         .collect();
-    let embedding = embedder
+    embedder
         .embed_pcm(&pcm)
-        .with_context(|| format!("embed speaker {}", path.display()))?;
-    Ok(RegisteredSpeaker {
-        name: name.to_string(),
-        embedding,
-    })
+        .with_context(|| format!("embed speaker {}", path.display()))
 }
 
 fn read_wav_16khz_mono(path: &Path) -> Result<Vec<f32>> {
@@ -572,5 +627,43 @@ mod tests {
             serde_json::from_str(r#"{"alice":"agent-a","bob":"agent-b"}"#).unwrap();
         assert_eq!(map.get("alice").map(String::as_str), Some("agent-a"));
         assert_eq!(map.get("bob").map(String::as_str), Some("agent-b"));
+    }
+
+    #[test]
+    fn speaker_similarity_uses_top_k_mean() {
+        let query = vec![1.0, 0.0];
+        let embeddings = vec![
+            vec![0.1, 0.0],
+            vec![0.9, 0.0],
+            vec![0.6, 0.0],
+            vec![0.3, 0.0],
+        ];
+
+        let score = speaker_similarity(&query, &embeddings, 3);
+
+        assert!((score - 0.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn registry_identify_scores_each_speaker_from_multiple_samples() {
+        let registry = SpeakerRegistry {
+            speakers: vec![
+                RegisteredSpeaker {
+                    name: "alice".to_string(),
+                    embeddings: vec![vec![0.7, 0.0], vec![0.8, 0.0], vec![0.9, 0.0]],
+                },
+                RegisteredSpeaker {
+                    name: "bob".to_string(),
+                    embeddings: vec![vec![0.95, 0.0], vec![0.1, 0.0], vec![0.1, 0.0]],
+                },
+            ],
+            agent_map: HashMap::from([("alice".to_string(), "agent-a".to_string())]),
+        };
+
+        let identity = registry.identify(&[1.0, 0.0], "default-agent", 0.35);
+
+        assert_eq!(identity.speaker_name.as_deref(), Some("alice"));
+        assert_eq!(identity.agent_id, "agent-a");
+        assert!((identity.similarity - 0.8).abs() < f32::EPSILON);
     }
 }
