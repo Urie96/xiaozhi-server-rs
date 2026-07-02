@@ -213,7 +213,7 @@ handle_websocket()
 - `LD_LIBRARY_PATH` 必须包含 `pkgs.onnxruntime`。
 - `main.rs::init_onnx_runtime()` 在启动时就 `ort::init_from(&dylib_path).commit()`；失败直接退出，**不要**等 listen.start 才报错。
 - 默认开启 VAD；想关掉设 `XIAOZHI_VAD_PROVIDER=none`。
-- 模型默认路径 `models/silero_vad.onnx`，如果不存在会 fallback 到 `/home/urie/temp/silero-vad/src/silero_vad/data/silero_vad.onnx`（本机开发专用）。
+- 模型默认路径 `models/silero_vad.onnx`，启动时如果文件不存在直接退出并报错。可通过 `SILERO_VAD_MODEL_PATH` 或 `XIAOZHI_VAD_MODEL_PATH` 覆盖路径，或设 `XIAOZHI_VAD_PROVIDER=none` 禁用 VAD。
 
 ### 6.4 火山引擎 TTS pacing
 - ESP32 `PushPacketToDecodeQueue(false)` 在解码队列满时会**丢包**。所以不能 firehose。
@@ -307,6 +307,11 @@ handle_websocket()
 | `XIAOZHI_VAD_SPEECH_PAD_MS` | `64` | |
 | `XIAOZHI_VAD_MIN_SPEECH_MS` | `160` | 短于这个不算 |
 | `XIAOZHI_VAD_MAX_SPEECH_SECONDS` | `15.0` | 单段最长；超过强制结束 |
+
+### Audio Saving
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `XIAOZHI_SAVE_AUDIO_DIR` | —（关闭） | 目录路径；设置后每次 listen 结束保存 PCM 16kHz mono WAV 到此目录，文件名 `{session_id}_{unix_ms}.wav`。用于离线声纹注册。不设置或留空则不保存 |
 
 ### ONNX Runtime
 | 变量 | 默认 | 说明 |

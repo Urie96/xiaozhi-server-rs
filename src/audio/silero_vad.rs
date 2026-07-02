@@ -7,7 +7,6 @@ use ort::{session::Session, value::Value};
 const DEFAULT_SAMPLE_RATE: usize = 16_000;
 const DEFAULT_FRAME_SIZE_MS: usize = 32;
 const DEFAULT_MODEL_PATH: &str = "models/silero_vad.onnx";
-const FALLBACK_MODEL_PATH: &str = "/home/urie/temp/silero-vad/src/silero_vad/data/silero_vad.onnx";
 
 /// Consecutive frames above threshold required to confirm a speech onset.
 ///
@@ -44,7 +43,14 @@ impl SileroVadConfig {
             .or_else(|_| std::env::var("XIAOZHI_VAD_MODEL_PATH"))
             .ok()
             .map(PathBuf::from);
-        let model_path = configured_path.unwrap_or_else(default_model_path);
+        let model_path = configured_path.unwrap_or_else(|| PathBuf::from(DEFAULT_MODEL_PATH));
+
+        if !model_path.exists() {
+            bail!(
+                "Silero VAD model not found at {}; set SILERO_VAD_MODEL_PATH or XIAOZHI_VAD_MODEL_PATH, or disable VAD with XIAOZHI_VAD_PROVIDER=none",
+                model_path.display()
+            );
+        }
 
         Ok(Some(Self {
             model_path,
@@ -333,15 +339,6 @@ impl VadState {
         } else {
             None
         }
-    }
-}
-
-fn default_model_path() -> PathBuf {
-    let project_path = PathBuf::from(DEFAULT_MODEL_PATH);
-    if project_path.exists() {
-        project_path
-    } else {
-        PathBuf::from(FALLBACK_MODEL_PATH)
     }
 }
 

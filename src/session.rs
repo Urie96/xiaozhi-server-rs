@@ -1,5 +1,7 @@
 use std::{
     collections::VecDeque,
+    fs,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex as StdMutex},
     time::Instant,
 };
@@ -9,6 +11,7 @@ use async_stream::try_stream;
 use axum::extract::ws::{Message, WebSocket};
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
+use hound::{SampleFormat, WavSpec, WavWriter};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex, Notify, mpsc, oneshot},
@@ -710,6 +713,20 @@ async fn finish_listening(
         input_frames,
         "listen finished"
     );
+
+    // Optionally save turn PCM to WAV for offline voiceprint enrollment.
+    if let Some(ref pcm) = turn_pcm {
+        if let Some(dir) = save_audio_dir() {
+            if let Err(err) = save_turn_audio(&dir, &ctx.id, pcm) {
+                tracing::warn!(
+                    session_id = ctx.id,
+                    error = %err,
+                    "failed to save turn audio to wav"
+                );
+            }
+        }
+    }
+
     if let Some(asr) = asr {
         trigger_conversation(ctx, state, asr, turn_pcm).await;
     }
@@ -1419,6 +1436,54 @@ fn end_prompt_enabled() -> bool {
             .as_deref(),
         Some("0") | Some("false") | Some("off") | Some("no") | Some("disabled")
     )
+}
+
+/// Returns the directory where turn audio WAV files should be saved, if
+/// the feature is enabled via `XIAOZHI_SAVE_AUDIO_DIR`. When the env var
+/// is absent or empty the feature is disabled (the default).
+fn save_audio_dir() -> Option<PathBuf> {
+    std::env::var("XIAOZHI_SAVE_AUDIO_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Write PCM i16 samples (16 kHz, mono) to a WAV file in `dir`.
+/// The filename is `{session_id}_{unix_millis}.wav`.
+fn save_turn_audio(dir: &Path, session_id: &str, pcm: &[i16]) -> anyhow::Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("create audio save dir {}", dir.display()))?;
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let filename = format!("{session_id}_{ts_ms}.wav");
+    let path = dir.join(&filename);
+
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate: 16_000,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(&path, spec)
+        .with_context(|| format!("create wav {}", path.display()))?;
+    for &sample in pcm {
+        writer
+            .write_sample(sample)
+            .with_context(|| format!("write sample to wav {}", path.display()))?;
+    }
+    writer.finalize()
+        .with_context(|| format!("finalize wav {}", path.display()))?;
+
+    tracing::info!(
+        session_id,
+        path = %path.display(),
+        samples = pcm.len(),
+        "saved turn audio to wav"
+    );
+    Ok(())
 }
 
 /// Returns the matched command keyword if `text` is exactly (after
